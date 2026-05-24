@@ -759,9 +759,9 @@ class MattermostAdapter(BasePlatformAdapter):
         #   free_response_channels / MATTERMOST_FREE_RESPONSE_CHANNELS: Channel IDs where bot responds without mention
         #   allowed_channels / MATTERMOST_ALLOWED_CHANNELS: If set, bot ONLY responds in these channels (whitelist)
         if channel_type_raw != "D":
-            # allowed_channels check (whitelist — must pass before other gating).
+            # allowed_channels check (whitelist - must pass before other gating).
             # When set, messages from channels NOT in this list are silently
-            # ignored, even if @mentioned.  DMs are already excluded above.
+            # ignored, even if @mentioned. DMs are already excluded above.
             allowed_raw = self.config.extra.get("allowed_channels") if self.config.extra else None
             if allowed_raw is None:
                 allowed_raw = os.getenv("MATTERMOST_ALLOWED_CHANNELS", "")
@@ -795,7 +795,26 @@ class MattermostAdapter(BasePlatformAdapter):
                 for pattern in mention_patterns
             )
 
-            if require_mention and not is_free_channel and not has_mention:
+            thread_allows_followup = False
+            thread_root_id = post.get("root_id") or ""
+            if thread_root_id:
+                root_post = await self._api_get(f"posts/{thread_root_id}")
+                root_message = root_post.get("message", "") if root_post else ""
+                root_user_id = root_post.get("user_id", "") if root_post else ""
+                thread_allows_followup = (
+                    root_user_id == self._bot_user_id
+                    or any(
+                        pattern.lower() in root_message.lower()
+                        for pattern in mention_patterns
+                    )
+                )
+
+            if (
+                require_mention
+                and not is_free_channel
+                and not has_mention
+                and not thread_allows_followup
+            ):
                 logger.debug(
                     "Mattermost: skipping non-DM message without @mention (channel=%s)",
                     channel_id,
@@ -813,8 +832,19 @@ class MattermostAdapter(BasePlatformAdapter):
         sender_id = post.get("user_id", "")
         sender_name = data.get("sender_name", "").lstrip("@") or sender_id
 
-        # Thread support: if the post is in a thread, use root_id.
+        # Thread support:
+        # Mattermost threads are not separate channels. A thread is a normal
+        # channel post with root_id set to the root post. Normalize accepted
+        # top-level channel messages to their own post id when threaded replies
+        # are enabled so every downstream send path sees a stable thread_id.
         thread_id = post.get("root_id") or None
+        if (
+            not thread_id
+            and channel_type_raw != "D"
+            and self._reply_mode == "thread"
+            and post_id
+        ):
+            thread_id = post_id
 
         # Determine message type.
         file_ids = post.get("file_ids") or []
