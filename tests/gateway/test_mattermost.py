@@ -562,6 +562,25 @@ class TestMattermostMentionBehavior:
             assert msg.source.thread_id == "root_post_456"
 
     @pytest.mark.asyncio
+    async def test_thread_reply_missing_root_id_is_resolved_from_api(self):
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_get = AsyncMock(
+            side_effect=[
+                {"root_id": "root_post_456"},
+                {"message": "@hermes-bot start work", "user_id": "user_123"},
+            ]
+        )
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
+            os.environ.pop("MATTERMOST_FREE_RESPONSE_CHANNELS", None)
+            await self.adapter._handle_ws_event(
+                self._make_event("continue", post_id="reply_1")
+            )
+            assert self.adapter.handle_message.called
+            msg = self.adapter.handle_message.call_args[0][0]
+            assert msg.source.thread_id == "root_post_456"
+
+    @pytest.mark.asyncio
     async def test_thread_followup_allowed_when_root_mentioned_bot(self):
         self.adapter._api_get = AsyncMock(
             return_value={"message": "@hermes-bot start work", "user_id": "user_123"}

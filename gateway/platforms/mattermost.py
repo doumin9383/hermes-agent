@@ -838,6 +838,12 @@ class MattermostAdapter(BasePlatformAdapter):
         # top-level channel messages to their own post id when threaded replies
         # are enabled so every downstream send path sees a stable thread_id.
         thread_id = post.get("root_id") or None
+        if not thread_id and channel_type_raw != "D" and post_id:
+            try:
+                full_post = await self._api_get(f"posts/{post_id}")
+                thread_id = (full_post.get("root_id") or None) if full_post else None
+            except Exception as exc:
+                logger.debug("Mattermost: could not resolve root_id for post %s: %s", post_id, exc)
         if (
             not thread_id
             and channel_type_raw != "D"
