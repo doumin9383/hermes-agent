@@ -240,8 +240,8 @@ class TestMattermostSend:
         assert payload["root_id"] == "root_from_metadata"
 
     @pytest.mark.asyncio
-    async def test_send_reply_to_takes_precedence_over_metadata_thread_id(self):
-        """reply_to should remain the root when both reply_to and metadata.thread_id exist."""
+    async def test_send_metadata_thread_id_takes_precedence_over_reply_to(self):
+        """metadata.thread_id should remain the root when reply_to points at a child reply."""
         self.adapter._reply_mode = "thread"
 
         mock_resp = AsyncMock()
@@ -262,7 +262,7 @@ class TestMattermostSend:
 
         assert result.success is True
         payload = self.adapter._session.post.call_args[1]["json"]
-        assert payload["root_id"] == "root_from_reply"
+        assert payload["root_id"] == "root_from_metadata"
 
     @pytest.mark.asyncio
     async def test_send_document_with_metadata_thread_id(self, tmp_path):
@@ -610,6 +610,14 @@ class TestMattermostMentionBehavior:
             os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
             await self.adapter._handle_ws_event(self._make_event("hello", channel_type="D"))
             assert self.adapter.handle_message.called
+
+    def test_metadata_thread_id_takes_precedence_over_reply_to(self):
+        self.adapter._reply_mode = "thread"
+        root_id = self.adapter._thread_root_id(
+            reply_to="reply_post_123",
+            metadata={"thread_id": "root_post_456"},
+        )
+        assert root_id == "root_post_456"
 
     @pytest.mark.asyncio
     async def test_mention_stripped_from_text(self):

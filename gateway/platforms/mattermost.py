@@ -808,7 +808,7 @@ class MattermostAdapter(BasePlatformAdapter):
 
             thread_allows_followup = False
             thread_root_id = resolved_root_id or ""
-            if thread_root_id:
+            if require_mention and not is_free_channel and not has_mention and thread_root_id:
                 root_post = await self._api_get(f"posts/{thread_root_id}")
                 root_message = root_post.get("message", "") if root_post else ""
                 root_user_id = root_post.get("user_id", "") if root_post else ""
