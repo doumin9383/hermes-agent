@@ -562,7 +562,7 @@ class TestMattermostMentionBehavior:
             assert msg.source.thread_id == "root_post_456"
 
     @pytest.mark.asyncio
-    async def test_thread_reply_missing_root_id_is_resolved_from_api(self):
+    async def test_thread_reply_missing_root_id_is_resolved_before_mention_gate(self):
         self.adapter._reply_mode = "thread"
         self.adapter._api_get = AsyncMock(
             side_effect=[

@@ -753,6 +753,17 @@ class MattermostAdapter(BasePlatformAdapter):
         # For DMs, user_id is sufficient.  For channels, check for @mention.
         message_text = post.get("message", "")
 
+        # Mattermost WebSocket post payloads can omit root_id for thread
+        # replies. Resolve it before mention gating so follow-up replies in an
+        # existing Hermes thread are not dropped as unmentioned channel posts.
+        resolved_root_id = post.get("root_id") or None
+        if not resolved_root_id and channel_type_raw != "D" and post_id:
+            try:
+                full_post = await self._api_get(f"posts/{post_id}")
+                resolved_root_id = (full_post.get("root_id") or None) if full_post else None
+            except Exception as exc:
+                logger.debug("Mattermost: could not resolve root_id for post %s: %s", post_id, exc)
+
         # Mention-gating for non-DM channels.
         # Config (config.yaml `mattermost.*` with env-var fallback):
         #   require_mention / MATTERMOST_REQUIRE_MENTION: Require @mention in channels (default: true)
@@ -796,7 +807,7 @@ class MattermostAdapter(BasePlatformAdapter):
             )
 
             thread_allows_followup = False
-            thread_root_id = post.get("root_id") or ""
+            thread_root_id = resolved_root_id or ""
             if thread_root_id:
                 root_post = await self._api_get(f"posts/{thread_root_id}")
                 root_message = root_post.get("message", "") if root_post else ""
@@ -837,13 +848,7 @@ class MattermostAdapter(BasePlatformAdapter):
         # channel post with root_id set to the root post. Normalize accepted
         # top-level channel messages to their own post id when threaded replies
         # are enabled so every downstream send path sees a stable thread_id.
-        thread_id = post.get("root_id") or None
-        if not thread_id and channel_type_raw != "D" and post_id:
-            try:
-                full_post = await self._api_get(f"posts/{post_id}")
-                thread_id = (full_post.get("root_id") or None) if full_post else None
-            except Exception as exc:
-                logger.debug("Mattermost: could not resolve root_id for post %s: %s", post_id, exc)
+        thread_id = resolved_root_id
         if (
             not thread_id
             and channel_type_raw != "D"
