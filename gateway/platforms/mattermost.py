@@ -5,10 +5,18 @@ Connects to a self-hosted (or cloud) Mattermost instance via its REST API
 required — uses aiohttp which is already a Hermes dependency.
 
 Environment variables:
-    MATTERMOST_URL              Server URL (e.g. https://mm.example.com)
-    MATTERMOST_TOKEN            Bot token or personal-access token
-    MATTERMOST_ALLOWED_USERS    Comma-separated user IDs
-    MATTERMOST_HOME_CHANNEL     Channel ID for cron/notification delivery
+    MATTERMOST_URL                      Server URL (e.g. https://mm.example.com)
+    MATTERMOST_TOKEN                    Bot token or personal-access token
+    MATTERMOST_ALLOWED_USERS            Comma-separated user IDs
+    MATTERMOST_HOME_CHANNEL             Channel ID for cron/notification delivery
+    MATTERMOST_CALLBACK_HOST            HTTP callback server bind address (default: 0.0.0.0)
+    MATTERMOST_CALLBACK_PORT            HTTP callback server port (default: 8580)
+    MATTERMOST_CALLBACK_URL             Public URL for Mattermost to POST action callbacks;
+                                        auto-derived from host/port when not set
+    MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL Public URL for Mattermost to POST slash command
+                                        invocations; when set, enables slash command
+                                        autocomplete via command registration
+    MATTERMOST_SLASH_WEBHOOK_LISTEN     Slash webhook bind address:port (default: 127.0.0.1:8645)
 """
 
 from __future__ import annotations
@@ -48,6 +56,21 @@ _CHANNEL_TYPE_MAP = {
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _RECONNECT_JITTER = 0.2
+
+# Interactive-action callback server.
+_CALLBACK_DEFAULT_PORT = 8580
+_CALLBACK_DEFAULT_HOST = "0.0.0.0"
+_CALLBACK_PATH = "/mattermost/action"
+# How long to wait for the Mattermost POST body before giving up.
+_CALLBACK_READ_TIMEOUT_SECONDS = 10.0
+
+# Slash-command webhook server (autocomplete support).
+# When MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL is set, the adapter registers
+# all gateway-available slash commands from COMMAND_REGISTRY via the
+# Mattermost REST API so they appear in the / autocomplete dropdown.
+_SLASH_WEBHOOK_DEFAULT_HOST = "127.0.0.1"
+_SLASH_WEBHOOK_DEFAULT_PORT = 8645
+_SLASH_WEBHOOK_PATH = "/mattermost/slash"
 
 
 def check_mattermost_requirements() -> bool:
@@ -98,6 +121,37 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Dedup cache (prevent reprocessing)
         self._dedup = MessageDeduplicator()
+
+        # Interactive-action callback server.
+        self._callback_host: str = os.getenv(
+            "MATTERMOST_CALLBACK_HOST", _CALLBACK_DEFAULT_HOST
+        )
+        self._callback_port: int = int(
+            os.getenv("MATTERMOST_CALLBACK_PORT", str(_CALLBACK_DEFAULT_PORT))
+        )
+        self._callback_url: str = os.getenv("MATTERMOST_CALLBACK_URL", "")
+        self._callback_app: Any = None   # aiohttp.web.Application
+        self._callback_runner: Any = None  # web.AppRunner
+        self._callback_site: Any = None    # web.TCPSite
+
+        # Per-prompt state keyed by a local monotonic counter value.
+        self._approval_state: Dict[int, str] = {}     # counter → session_key
+        self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
+        self._clarify_state: Dict[str, str] = {}       # clarify_id → ... (opaque)
+        self._interactive_counter: int = 0
+
+        # Slash-command webhook for autocomplete.
+        self._slash_webhook_public_url: str = os.getenv(
+            "MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL", ""
+        )
+        self._slash_webhook_listen: str = os.getenv(
+            "MATTERMOST_SLASH_WEBHOOK_LISTEN",
+            f"{_SLASH_WEBHOOK_DEFAULT_HOST}:{_SLASH_WEBHOOK_DEFAULT_PORT}",
+        )
+        self._slash_app: Any = None
+        self._slash_runner: Any = None
+        self._slash_site: Any = None
+        self._registered_slash_command_ids: List[str] = []
 
     def _thread_root_id(
         self,
@@ -179,6 +233,24 @@ class MattermostAdapter(BasePlatformAdapter):
             logger.error("MM API PUT %s network error: %s", path, exc)
             return {}
 
+    async def _api_delete(self, path: str) -> bool:
+        """DELETE /api/v4/{path}. Returns True on success (2xx)."""
+        import aiohttp
+        url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
+        try:
+            async with self._session.delete(
+                url, headers=self._headers(),
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.error("MM API DELETE %s → %s: %s", path, resp.status, body[:200])
+                    return False
+                return True
+        except aiohttp.ClientError as exc:
+            logger.error("MM API DELETE %s network error: %s", path, exc)
+            return False
+
     async def _upload_file(
         self, channel_id: str, file_data: bytes, filename: str, content_type: str = "application/octet-stream"
     ) -> Optional[str]:
@@ -239,12 +311,43 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Start WebSocket in background.
         self._ws_task = asyncio.create_task(self._ws_loop())
+
+        # Start the HTTP callback server for interactive actions.
+        try:
+            await self._start_callback_server()
+        except Exception as exc:
+            logger.warning(
+                "Mattermost: callback server failed to start — "
+                "interactive buttons will fall back to text: %s", exc,
+            )
+
+        # Start slash-command webhook and register commands.
+        try:
+            await self._start_slash_webhook()
+        except Exception as exc:
+            logger.warning(
+                "Mattermost: slash webhook failed to start: %s", exc,
+            )
+        try:
+            await self._register_slash_commands()
+        except Exception as exc:
+            logger.warning(
+                "Mattermost: slash command registration failed: %s", exc,
+            )
+
         self._mark_connected()
         return True
 
     async def disconnect(self) -> None:
         """Disconnect from Mattermost."""
         self._closing = True
+
+        # Stop the callback server first.
+        await self._stop_callback_server()
+
+        # Clean up slash commands and webhook.
+        await self._cleanup_slash_commands()
+        await self._stop_slash_webhook()
 
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
@@ -334,10 +437,17 @@ class MattermostAdapter(BasePlatformAdapter):
     async def send_typing(
         self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Send a typing indicator."""
+        """Send a typing indicator.
+
+        Includes ``parent_id`` when replying in a thread so the typing
+        indicator appears inside the thread rather than the channel.
+        """
+        payload: Dict[str, Any] = {"channel_id": chat_id}
+        if metadata and metadata.get("thread_id"):
+            payload["parent_id"] = metadata["thread_id"]
         await self._api_post(
             f"users/{self._bot_user_id}/typing",
-            {"channel_id": chat_id},
+            payload,
         )
 
     async def edit_message(
@@ -352,6 +462,736 @@ class MattermostAdapter(BasePlatformAdapter):
         if not data or "id" not in data:
             return SendResult(success=False, error="Failed to edit post")
         return SendResult(success=True, message_id=data["id"])
+
+    # ------------------------------------------------------------------
+    # Interactive-action callback server
+    # ------------------------------------------------------------------
+
+    async def _start_callback_server(self) -> None:
+        """Start the aiohttp HTTP server for interactive action callbacks.
+
+        This server receives POST requests from the Mattermost server when
+        a user clicks an interactive message button.  The callback URL is
+        either configured explicitly via ``MATTERMOST_CALLBACK_URL`` or
+        derived from the bind host and port.
+        """
+        from aiohttp import web
+
+        app = web.Application()
+
+        # Health-check endpoint.
+        app.router.add_get("/mattermost/health", self._health_check_handler)
+
+        # Action callback endpoint.
+        app.router.add_post(_CALLBACK_PATH, self._action_callback_handler)
+
+        self._callback_app = app
+        self._callback_runner = web.AppRunner(app)
+        await self._callback_runner.setup()
+        self._callback_site = web.TCPSite(
+            self._callback_runner, self._callback_host, self._callback_port,
+        )
+        await self._callback_site.start()
+
+        # Derive the public callback URL if not explicitly set.
+        if not self._callback_url:
+            self._callback_url = (
+                f"http://{self._callback_host}:{self._callback_port}"
+                f"{_CALLBACK_PATH}"
+            )
+            # If the host is 0.0.0.0, hint that the user should set the URL explicitly.
+            if self._callback_host in {"0.0.0.0", "::"}:
+                logger.info(
+                    "Mattermost: callback server listening on %s:%s — "
+                    "set MATTERMOST_CALLBACK_URL if Mattermost cannot reach "
+                    "this address directly",
+                    self._callback_host, self._callback_port,
+                )
+        logger.info(
+            "Mattermost: callback server ready at %s", self._callback_url,
+        )
+
+    async def _stop_callback_server(self) -> None:
+        """Stop the interactive-action callback server."""
+        if self._callback_site:
+            try:
+                await self._callback_site.stop()
+            except Exception as exc:
+                logger.debug("Mattermost: callback site stop: %s", exc)
+            self._callback_site = None
+        if self._callback_runner:
+            try:
+                await self._callback_runner.cleanup()
+            except Exception as exc:
+                logger.debug("Mattermost: callback runner cleanup: %s", exc)
+            self._callback_runner = None
+        self._callback_app = None
+        logger.info("Mattermost: callback server stopped")
+
+    async def _health_check_handler(self, request: Any) -> Any:
+        """Simple health check for the callback server."""
+        from aiohttp import web
+        return web.json_response({"status": "ok", "adapter": "mattermost"})
+
+    async def _action_callback_handler(self, request: Any) -> Any:
+        """Handle an incoming Mattermost interactive-action POST.
+
+        Mattermost sends this when a user clicks an interactive message
+        button.  The body contains the action context we embedded when
+        creating the message.
+        """
+        from aiohttp import web
+
+        try:
+            data = await request.json()
+        except Exception:
+            logger.warning("Mattermost: invalid action callback body")
+            return web.json_response(
+                {"error": "invalid body"}, status=400,
+            )
+
+        context = data.get("context", {}) or {}
+        action_type = context.get("action_type", "")
+        user_name = data.get("user_name", data.get("user_id", "Unknown"))
+
+        logger.info(
+            "Mattermost: action callback type=%s user=%s",
+            action_type, user_name,
+        )
+
+        if action_type == "exec_approval":
+            return await self._handle_exec_approval_callback(data, context, user_name)
+        elif action_type == "slash_confirm":
+            return await self._handle_slash_confirm_callback(data, context, user_name)
+        elif action_type == "clarify":
+            return await self._handle_clarify_callback(data, context, user_name)
+        elif action_type == "update_prompt":
+            return await self._handle_update_prompt_callback(data, context, user_name)
+        else:
+            logger.warning(
+                "Mattermost: unknown action_type %r", action_type,
+            )
+            return web.json_response({"error": "unknown action"}, status=400)
+
+    async def _build_update_response(
+        self, user_name: str, label: str,
+    ) -> Any:
+        """Build an aiohttp JSON response that updates the original post.
+
+        Mattermost expects a JSON body from the action callback; the
+        ``update`` key replaces the original post's content.
+        """
+        from aiohttp import web
+        return web.json_response({
+            "update": {
+                "message": f"{label} by @{user_name}",
+                "props": {},
+                "attachments": [],
+            },
+        })
+
+    async def _handle_exec_approval_callback(
+        self, data: dict, context: dict, user_name: str,
+    ) -> Any:
+        """Resolve a pending exec-approval from a button click."""
+        from aiohttp import web
+
+        approval_id = context.get("approval_id")
+        choice = context.get("choice", "deny")
+        if approval_id is None:
+            return web.json_response({"error": "missing approval_id"}, status=400)
+
+        session_key = self._approval_state.pop(approval_id, None)
+        if not session_key:
+            return web.json_response({
+                "update": {
+                    "message": "This approval has already been resolved.",
+                    "props": {},
+                    "attachments": [],
+                },
+            })
+
+        label_map = {
+            "once": "✅ Approved once",
+            "session": "✅ Approved for session",
+            "always": "✅ Approved permanently",
+            "deny": "❌ Denied",
+        }
+        label = label_map.get(choice, "Resolved")
+
+        from tools.approval import resolve_gateway_approval
+        try:
+            count = resolve_gateway_approval(session_key, choice)
+            logger.info(
+                "Mattermost button resolved %d approval(s) for session %s "
+                "(choice=%s, user=%s)",
+                count, session_key, choice, user_name,
+            )
+        except Exception as exc:
+            logger.error(
+                "Mattermost: failed to resolve approval: %s", exc,
+            )
+
+        return await self._build_update_response(user_name, label)
+
+    async def _handle_slash_confirm_callback(
+        self, data: dict, context: dict, user_name: str,
+    ) -> Any:
+        """Resolve a pending slash-confirm from a button click."""
+        from aiohttp import web
+
+        confirm_id = context.get("confirm_id")
+        choice = context.get("choice", "cancel")
+        if not confirm_id:
+            return web.json_response({"error": "missing confirm_id"}, status=400)
+
+        session_key = self._slash_confirm_state.pop(confirm_id, None)
+        if not session_key:
+            return web.json_response({
+                "update": {
+                    "message": "This prompt has already been resolved.",
+                    "props": {},
+                    "attachments": [],
+                },
+            })
+
+        label_map = {
+            "once": "✅ Approved once",
+            "always": "🔒 Always approve",
+            "cancel": "❌ Cancelled",
+        }
+        label = label_map.get(choice, "Resolved")
+
+        from tools import slash_confirm as _sc
+        try:
+            result_text = await _sc.resolve(session_key, confirm_id, choice)
+            if result_text:
+                logger.info(
+                    "Mattermost slash-confirm result: %s", result_text,
+                )
+        except Exception as exc:
+            logger.error(
+                "Mattermost: failed to resolve slash confirm: %s", exc,
+            )
+
+        return await self._build_update_response(user_name, label)
+
+    async def _handle_clarify_callback(
+        self, data: dict, context: dict, user_name: str,
+    ) -> Any:
+        """Resolve a pending clarify from a button click."""
+        from aiohttp import web
+
+        clarify_id = context.get("clarify_id")
+        response = context.get("response", "")
+        if not clarify_id:
+            return web.json_response({"error": "missing clarify_id"}, status=400)
+
+        from tools.clarify_gateway import (
+            resolve_gateway_clarify,
+            mark_awaiting_text,
+        )
+
+        if response == "__other__":
+            mark_awaiting_text(clarify_id)
+            label = "✏️ Awaiting your typed answer"
+        else:
+            resolve_gateway_clarify(clarify_id, response)
+            label = f"✅ You chose: {response}"
+
+        return await self._build_update_response(user_name, label)
+
+    async def _handle_update_prompt_callback(
+        self, data: dict, context: dict, user_name: str,
+    ) -> Any:
+        """Handle an update-prompt button click (Yes / No)."""
+        from aiohttp import web
+
+        choice = context.get("choice", "n")
+        label = "✅ Yes" if choice == "y" else "❌ No"
+        return await self._build_update_response(user_name, label)
+
+    # ------------------------------------------------------------------
+    # Interactive messages (buttons)
+    # ------------------------------------------------------------------
+
+    async def _send_interactive_post(
+        self,
+        chat_id: str,
+        message: str,
+        attachments: List[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a post with interactive message attachments (action buttons).
+
+        This is the common send helper for all button-based prompts.
+        """
+        payload: Dict[str, Any] = {
+            "channel_id": chat_id,
+            "message": message,
+            "attachments": attachments,
+        }
+        root_id = self._thread_root_id(None, metadata)
+        if root_id:
+            payload["root_id"] = root_id
+        data = await self._api_post("posts", payload)
+        if not data or "id" not in data:
+            return SendResult(success=False, error="Failed to create interactive post")
+        return SendResult(success=True, message_id=data["id"])
+
+    def _next_interactive_id(self) -> int:
+        """Return a monotonic counter for interactive prompts."""
+        self._interactive_counter += 1
+        return self._interactive_counter
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a button-based exec-approval prompt for a dangerous command.
+
+        Four buttons: Allow Once, Session, Always, Deny.
+        Button clicks call ``resolve_gateway_approval()`` via the callback
+        server to unblock the waiting agent thread.
+        """
+        if not self._callback_runner:
+            logger.warning(
+                "Mattermost: callback server not running — "
+                "falling back to text approval",
+            )
+            return SendResult(success=False, error="Callback server not running")
+
+        cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
+        attachment_text = f"```\\n{cmd_preview}\\n```\\n\\nReason: {description}"
+
+        approval_id = self._next_interactive_id()
+        self._approval_state[approval_id] = session_key
+
+        button = lambda name, choice: {
+            "name": name,
+            "integration": {
+                "url": self._callback_url,
+                "context": {
+                    "action_type": "exec_approval",
+                    "approval_id": approval_id,
+                    "choice": choice,
+                },
+            },
+            "type": "button",
+        }
+
+        attachments = [{
+            "title": "⚠️ Command Approval Required",
+            "text": attachment_text,
+            "actions": [
+                button("✅ Allow Once", "once"),
+                button("✅ Session", "session"),
+                button("✅ Always", "always"),
+                button("❌ Deny", "deny"),
+            ],
+        }]
+
+        return await self._send_interactive_post(
+            chat_id, "", attachments, metadata,
+        )
+
+    async def send_slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        session_key: str,
+        confirm_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a three-button slash-command confirmation prompt.
+
+        Buttons: Approve Once, Always Approve, Cancel.
+        """
+        if not self._callback_runner:
+            return SendResult(success=False, error="Callback server not running")
+
+        body = message[:3800] + "..." if len(message) > 3800 else message
+        self._slash_confirm_state[confirm_id] = session_key
+
+        button = lambda name, choice: {
+            "name": name,
+            "integration": {
+                "url": self._callback_url,
+                "context": {
+                    "action_type": "slash_confirm",
+                    "confirm_id": confirm_id,
+                    "choice": choice,
+                },
+            },
+            "type": "button",
+        }
+
+        attachments = [{
+            "title": title or "Confirm",
+            "text": body,
+            "actions": [
+                button("✅ Approve Once", "once"),
+                button("🔒 Always Approve", "always"),
+                button("❌ Cancel", "cancel"),
+            ],
+        }]
+
+        return await self._send_interactive_post(
+            chat_id, "", attachments, metadata,
+        )
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[List[str]],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a clarify prompt with choice buttons.
+
+        In multi-choice mode, renders one button per option plus a final
+        "✏️ Other" button for free-text input.  In open-ended mode, falls
+        back to plain text.
+        """
+        if not self._callback_runner:
+            return SendResult(success=False, error="Callback server not running")
+
+        clean_choices = [
+            str(c).strip() for c in (choices or [])
+            if c is not None and str(c).strip()
+        ]
+        # Mattermost allows up to 5 actions per attachment row,
+        # with up to 20 total. Cap at 19 (reserve one for "Other").
+        clean_choices = clean_choices[:19]
+
+        if clean_choices:
+            button = lambda name, resp: {
+                "name": name,
+                "integration": {
+                    "url": self._callback_url,
+                    "context": {
+                        "action_type": "clarify",
+                        "clarify_id": clarify_id,
+                        "response": resp,
+                    },
+                },
+                "type": "button",
+            }
+
+            actions = [button(c, c) for c in clean_choices]
+            actions.append(button("✏️ Other (type answer)", "__other__"))
+
+            attachments = [{
+                "title": "❓ Hermes needs your input",
+                "text": question,
+                "actions": actions,
+            }]
+
+            return await self._send_interactive_post(
+                chat_id, "", attachments, metadata,
+            )
+
+        # Open-ended: no choices, fall back to base text handling.
+        return await super().send_clarify(
+            chat_id, question, choices, clarify_id, session_key, metadata,
+        )
+
+    async def send_update_prompt(
+        self,
+        chat_id: str,
+        prompt: str,
+        default: str = "",
+        session_key: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Yes / No update prompt (used by the /update watcher)."""
+        if not self._callback_runner:
+            return SendResult(success=False, error="Callback server not running")
+
+        default_hint = f" (default: {default})" if default else ""
+        text = f"⚕ *Update needs your input:*\\n\\n{prompt}{default_hint}"
+
+        button = lambda name, choice: {
+            "name": name,
+            "integration": {
+                "url": self._callback_url,
+                "context": {
+                    "action_type": "update_prompt",
+                    "choice": choice,
+                },
+            },
+            "type": "button",
+        }
+
+        attachments = [{
+            "title": "Update",
+            "text": text,
+            "actions": [
+                button("✓ Yes", "y"),
+                button("✗ No", "n"),
+            ],
+        }]
+
+        return await self._send_interactive_post(
+            chat_id, "", attachments, metadata,
+        )
+
+    # ------------------------------------------------------------------
+    # Slash-command webhook (autocomplete)
+    # ------------------------------------------------------------------
+
+    async def _start_slash_webhook(self) -> None:
+        """Start the aiohttp HTTP server for slash-command callbacks.
+
+        This server receives POST requests from the Mattermost server when
+        a user triggers a registered slash command.  The public URL must be
+        configured via ``MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL``; the feature
+        is disabled when that variable is not set.
+        """
+        if not self._slash_webhook_public_url:
+            logger.info(
+                "Mattermost: MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL not set — "
+                "slash command autocomplete disabled",
+            )
+            return
+
+        from aiohttp import web
+
+        # Parse host:port.
+        listen_parts = self._slash_webhook_listen.rsplit(":", 1)
+        try:
+            host = listen_parts[0].strip() or _SLASH_WEBHOOK_DEFAULT_HOST
+            port = int(listen_parts[1].strip()) if len(listen_parts) > 1 else _SLASH_WEBHOOK_DEFAULT_PORT
+        except (ValueError, IndexError):
+            logger.warning(
+                "Mattermost: invalid MATTERMOST_SLASH_WEBHOOK_LISTEN=%r, "
+                "falling back to %s:%d",
+                self._slash_webhook_listen,
+                _SLASH_WEBHOOK_DEFAULT_HOST,
+                _SLASH_WEBHOOK_DEFAULT_PORT,
+            )
+            host = _SLASH_WEBHOOK_DEFAULT_HOST
+            port = _SLASH_WEBHOOK_DEFAULT_PORT
+
+        app = web.Application()
+        app.router.add_post(_SLASH_WEBHOOK_PATH, self._handle_slash_webhook)
+
+        self._slash_app = app
+        self._slash_runner = web.AppRunner(app)
+        await self._slash_runner.setup()
+        self._slash_site = web.TCPSite(
+            self._slash_runner, host, port,
+        )
+        await self._slash_site.start()
+
+        logger.info(
+            "Mattermost: slash webhook ready at %s (listening on %s:%d)",
+            self._slash_webhook_public_url, host, port,
+        )
+
+    async def _stop_slash_webhook(self) -> None:
+        """Stop the slash-command webhook server."""
+        if self._slash_site:
+            try:
+                await self._slash_site.stop()
+            except Exception as exc:
+                logger.debug("Mattermost: slash site stop: %s", exc)
+            self._slash_site = None
+        if self._slash_runner:
+            try:
+                await self._slash_runner.cleanup()
+            except Exception as exc:
+                logger.debug("Mattermost: slash runner cleanup: %s", exc)
+            self._slash_runner = None
+        self._slash_app = None
+        logger.info("Mattermost: slash webhook stopped")
+
+    async def _handle_slash_webhook(self, request: Any) -> Any:
+        """Handle an incoming slash-command POST from Mattermost.
+
+        The body contains:
+
+        - ``channel_id`` — channel the command was typed in
+        - ``user_id`` — who triggered it
+        - ``user_name`` — display name
+        - ``command`` — e.g. ``/help``
+        - ``text`` — everything after the command trigger
+        - ``team_id`` — Mattermost team
+
+        We construct a ``MessageEvent`` with the full command text and
+        route it through the normal message-handling pipeline so the
+        agent processes it just like a WebSocket-posted message.
+        """
+        from aiohttp import web
+
+        try:
+            data = await request.json()
+        except Exception:
+            logger.warning("Mattermost: invalid slash webhook body")
+            return web.json_response(
+                {"error": "invalid body"}, status=400,
+            )
+
+        channel_id = data.get("channel_id", "")
+        user_id = data.get("user_id", "")
+        user_name = data.get("user_name", user_id)
+        command = data.get("command", "").strip()
+        text = data.get("text", "").strip()
+
+        if not command or not channel_id:
+            logger.warning("Mattermost: slash webhook missing command or channel_id")
+            return web.json_response(
+                {"error": "missing fields"}, status=400,
+            )
+
+        # Reconstruct the full message text as the user typed it.
+        full_text = command
+        if text:
+            full_text = f"{command} {text}"
+
+        logger.info(
+            "Mattermost: slash command %r from @%s in %s",
+            full_text, user_name, channel_id,
+        )
+
+        # Build source info.
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_type="channel",
+            user_id=user_id,
+            user_name=user_name,
+            thread_id=None,
+        )
+
+        # Resolve per-channel prompt.
+        from gateway.platforms.base import resolve_channel_prompt
+        _channel_prompt = resolve_channel_prompt(
+            self.config.extra, channel_id, None,
+        )
+
+        msg_event = MessageEvent(
+            text=full_text,
+            message_type=MessageType.COMMAND,
+            source=source,
+            raw_message=data,
+            message_id="",
+            media_urls=None,
+            media_types=None,
+            channel_prompt=_channel_prompt,
+        )
+
+        # Fire-and-forget: the agent processes the command asynchronously.
+        # We respond quickly so Mattermost doesn't time out the webhook.
+        asyncio.ensure_future(self.handle_message(msg_event))
+
+        return web.json_response({
+            "response_type": "ephemeral",
+            "text": "⏳ Processing...",
+        })
+
+    async def _register_slash_commands(self) -> None:
+        """Register all gateway-available commands with Mattermost.
+
+        Iterates ``COMMAND_REGISTRY`` from the CLI and registers each
+        command that is available on the gateway via ``POST /api/v4/commands``.
+        Registered command IDs are stored so they can be cleaned up on
+        disconnect.
+
+        Requires ``MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL`` to be set.
+        """
+        if not self._slash_webhook_public_url:
+            return
+
+        # Collect gateway-available commands from COMMAND_REGISTRY.
+        try:
+            from hermes_cli.commands import (
+                COMMAND_REGISTRY,
+                _is_gateway_available,
+                _resolve_config_gates,
+            )
+        except ImportError:
+            logger.warning(
+                "Mattermost: could not import COMMAND_REGISTRY — "
+                "slash commands not registered",
+            )
+            return
+
+        # Fetch the user's teams to register commands per-team.
+        teams_data = await self._api_get(f"users/{self._bot_user_id}/teams")
+        if not teams_data or not isinstance(teams_data, list):
+            logger.warning(
+                "Mattermost: no teams found — slash commands not registered",
+            )
+            return
+
+        config_overrides = _resolve_config_gates()
+        webhook_url = f"{self._slash_webhook_public_url}{_SLASH_WEBHOOK_PATH}"
+        registered_count = 0
+
+        for team_info in teams_data:
+            team_id = team_info.get("id")
+            if not team_id:
+                continue
+
+            for cmd in COMMAND_REGISTRY:
+                if not _is_gateway_available(cmd, config_overrides):
+                    continue
+                # Mattermost custom slash commands use the trigger word;
+                # use the canonical command name.
+                trigger = cmd.name.lower().replace("_", "-")
+                description = cmd.description[:64]  # Mattermost limit
+
+                payload = {
+                    "team_id": team_id,
+                    "trigger": trigger,
+                    "url": webhook_url,
+                    "method": "P",
+                    "display_name": f"/{cmd.name}",
+                    "description": description,
+                    "auto_complete": True,
+                    "auto_complete_desc": description,
+                    "auto_complete_hint": cmd.args_hint or "",
+                }
+
+                result = await self._api_post("commands", payload)
+                if result and "id" in result:
+                    self._registered_slash_command_ids.append(result["id"])
+                    registered_count += 1
+                else:
+                    logger.debug(
+                        "Mattermost: failed to register slash command /%s "
+                        "(may already exist)", cmd.name,
+                    )
+
+        if registered_count:
+            logger.info(
+                "Mattermost: registered %d slash command(s) across %d team(s)",
+                registered_count, len(teams_data),
+            )
+
+    async def _cleanup_slash_commands(self) -> None:
+        """Delete previously registered slash commands on disconnect."""
+        if not self._registered_slash_command_ids:
+            return
+
+        deleted = 0
+        for cmd_id in self._registered_slash_command_ids:
+            if await self._api_delete(f"commands/{cmd_id}"):
+                deleted += 1
+
+        if deleted:
+            logger.info(
+                "Mattermost: cleaned up %d/%d registered slash command(s)",
+                deleted, len(self._registered_slash_command_ids),
+            )
+        self._registered_slash_command_ids.clear()
 
     async def send_image(
         self,
