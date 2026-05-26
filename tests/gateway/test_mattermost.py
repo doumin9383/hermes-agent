@@ -197,10 +197,7 @@ class TestMattermostSend:
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=False)
 
-        # send() now calls _resolve_root_id → _api_get("posts/<id>") first
-        # to make sure root_id points to a thread root, so we need to mock
-        # the GET too.  Return an empty dict (no root_id) so the resolver
-        # falls back to the original reply_to as the root.
+        # send() now calls _resolve_root_id first
         mock_get_resp = AsyncMock()
         mock_get_resp.status = 200
         mock_get_resp.json = AsyncMock(return_value={"id": "root_post", "root_id": ""})
@@ -897,3 +894,750 @@ class TestMattermostMediaTypes:
         assert msg.media_types == ["application/pdf"]
         assert not msg.media_types[0].startswith("image/")
         assert not msg.media_types[0].startswith("audio/")
+
+
+# ---------------------------------------------------------------------------
+# _thread_root_id — edge cases
+# ---------------------------------------------------------------------------
+
+class TestMattermostThreadRootId:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    def test_reply_mode_off_returns_none_with_reply_to(self):
+        """When reply_mode is 'off', _thread_root_id returns None."""
+        self.adapter._reply_mode = "off"
+        assert self.adapter._thread_root_id(reply_to="post_123") is None
+
+    def test_reply_mode_off_returns_none_with_metadata(self):
+        self.adapter._reply_mode = "off"
+        assert self.adapter._thread_root_id(metadata={"thread_id": "root_123"}) is None
+
+    def test_reply_mode_thread_without_reply_to_or_metadata(self):
+        """When reply_mode is 'thread' but no args, returns None."""
+        self.adapter._reply_mode = "thread"
+        assert self.adapter._thread_root_id() is None
+
+    def test_thread_root_id_only_reply_to(self):
+        """reply_to used when there's no metadata."""
+        self.adapter._reply_mode = "thread"
+        result = self.adapter._thread_root_id(reply_to="reply_abc")
+        assert result == "reply_abc"
+
+    def test_thread_root_id_only_metadata_thread_id(self):
+        """metadata.thread_id used when there's no reply_to."""
+        self.adapter._reply_mode = "thread"
+        result = self.adapter._thread_root_id(metadata={"thread_id": "meta_root"})
+        assert result == "meta_root"
+
+    def test_thread_root_id_metadata_takes_precedence(self):
+        """metadata.thread_id wins over reply_to."""
+        self.adapter._reply_mode = "thread"
+        result = self.adapter._thread_root_id(
+            reply_to="reply_post",
+            metadata={"thread_id": "meta_root"},
+        )
+        assert result == "meta_root"
+
+    def test_thread_root_id_empty_thread_id_falls_through(self):
+        """metadata with thread_id='' falls through to reply_to."""
+        self.adapter._reply_mode = "thread"
+        result = self.adapter._thread_root_id(
+            reply_to="reply_abc",
+            metadata={"thread_id": ""},
+        )
+        assert result == "reply_abc"
+
+    def test_thread_root_id_empty_metadata_dict_falls_through(self):
+        """metadata={} falls through to reply_to."""
+        self.adapter._reply_mode = "thread"
+        result = self.adapter._thread_root_id(
+            reply_to="reply_abc",
+            metadata={},
+        )
+        assert result == "reply_abc"
+
+
+# ---------------------------------------------------------------------------
+# send_typing — thread parent_id support
+# ---------------------------------------------------------------------------
+
+class TestMattermostSendTyping:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._bot_user_id = "bot_u_123"
+        self.adapter._api_post = AsyncMock(return_value={})
+
+    @pytest.mark.asyncio
+    async def test_send_typing_basic(self):
+        """send_typing should POST to users/{id}/typing with channel_id."""
+        await self.adapter.send_typing("chan_1")
+        self.adapter._api_post.assert_called_once()
+        path = self.adapter._api_post.call_args[0][0]
+        payload = self.adapter._api_post.call_args[0][1]
+        assert "typing" in path
+        assert payload["channel_id"] == "chan_1"
+
+    @pytest.mark.asyncio
+    async def test_send_typing_with_thread_id_sets_parent_id(self):
+        """When metadata has thread_id, it should be passed as parent_id."""
+        await self.adapter.send_typing("chan_1", metadata={"thread_id": "thread_root_123"})
+        payload = self.adapter._api_post.call_args[0][1]
+        assert payload["parent_id"] == "thread_root_123"
+
+    @pytest.mark.asyncio
+    async def test_send_typing_without_thread_id_no_parent_id(self):
+        """Without thread_id metadata, parent_id should not be in payload."""
+        await self.adapter.send_typing("chan_1")
+        payload = self.adapter._api_post.call_args[0][1]
+        assert "parent_id" not in payload
+
+    @pytest.mark.asyncio
+    async def test_send_typing_correct_endpoint(self):
+        """The API endpoint should include the bot user ID."""
+        await self.adapter.send_typing("chan_1")
+        path = self.adapter._api_post.call_args[0][0]
+        assert f"users/{self.adapter._bot_user_id}/typing" in path
+
+
+# ---------------------------------------------------------------------------
+# Interactive message sending (buttons via Message Attachments)
+# ---------------------------------------------------------------------------
+
+class _InteractiveTestBase:
+    """Shared mocks for interactive message tests."""
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._api_post = AsyncMock()
+        self.adapter._callback_runner = MagicMock()  # non-None = server is running
+
+    def _assert_post_payload(self, chat_id, has_root_id=False, root_id_val="root_meta"):
+        """Verify the _api_post call had the right structure."""
+        self.adapter._api_post.assert_called_once()
+        path, payload = self.adapter._api_post.call_args[0]
+        assert "posts" in path
+        assert payload["channel_id"] == chat_id
+        if has_root_id:
+            assert payload["root_id"] == root_id_val
+        return payload
+
+
+class TestMattermostSendInteractivePost(_InteractiveTestBase):
+    @pytest.mark.asyncio
+    async def test_send_interactive_basic(self):
+        """_send_interactive_post sends attachments in the payload."""
+        self.adapter._api_post = AsyncMock(return_value={"id": "post_int"})
+        attachments = [{"title": "Test", "actions": []}]
+        result = await self.adapter._send_interactive_post(
+            "chan_1", "Hello", attachments,
+        )
+        assert result.success is True
+        assert result.message_id == "post_int"
+        payload = self.adapter._api_post.call_args[0][1]
+        assert payload["attachments"] == attachments
+        assert payload["message"] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_send_interactive_with_root_id(self):
+        """_send_interactive_post passes root_id when metadata.thread_id is set."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_post = AsyncMock(return_value={"id": "post_int2"})
+        result = await self.adapter._send_interactive_post(
+            "chan_1", "Hello", [],
+            metadata={"thread_id": "root_meta"},
+        )
+        assert result.success is True
+        payload = self.adapter._api_post.call_args[0][1]
+        assert payload["root_id"] == "root_meta"
+
+    @pytest.mark.asyncio
+    async def test_send_interactive_api_failure(self):
+        """When API returns empty dict, send returns failure."""
+        self.adapter._api_post = AsyncMock(return_value={})
+        result = await self.adapter._send_interactive_post(
+            "chan_1", "Hello", [],
+        )
+        assert result.success is False
+
+
+class TestMattermostSendExecApproval(_InteractiveTestBase):
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_sends_buttons(self):
+        """send_exec_approval sends approval message with four buttons."""
+        self.adapter._api_post = AsyncMock(return_value={"id": "approval_post"})
+
+        result = await self.adapter.send_exec_approval(
+            chat_id="chan_1",
+            command="rm -rf /important",
+            session_key="agent:main:chan_1:123",
+            description="dangerous command",
+        )
+
+        assert result.success is True
+        assert result.message_id == "approval_post"
+        payload = self.adapter._api_post.call_args[0][1]
+        assert payload["channel_id"] == "chan_1"
+        attachments = payload["attachments"]
+        assert len(attachments) == 1
+        assert "Command Approval" in attachments[0]["title"]
+        actions = attachments[0]["actions"]
+        assert len(actions) == 4
+        labels = [a["name"] for a in actions]
+        assert "Allow Once" in labels[0] or "✅ Allow Once" in labels[0]
+
+    @pytest.mark.asyncio
+    async def test_exec_approval_with_metadata_thread_id(self):
+        """send_exec_approval respects metadata.thread_id."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_post = AsyncMock(return_value={"id": "approval_post2"})
+
+        result = await self.adapter.send_exec_approval(
+            chat_id="chan_1",
+            command="rm -rf /important",
+            session_key="agent:main:chan_1:123",
+            metadata={"thread_id": "thread_root"},
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args[0][1]
+        assert payload["root_id"] == "thread_root"
+
+    @pytest.mark.asyncio
+    async def test_exec_approval_long_command_truncated(self):
+        """Very long commands are truncated in the preview."""
+        long_cmd = "x" * 5000
+        self.adapter._api_post = AsyncMock(return_value={"id": "approval_post3"})
+
+        result = await self.adapter.send_exec_approval(
+            chat_id="chan_1",
+            command=long_cmd,
+            session_key="agent:main:chan_1:123",
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args[0][1]
+        text = payload["attachments"][0]["text"]
+        assert len(text) < 4500
+        assert "..." in text
+
+    @pytest.mark.asyncio
+    async def test_exec_approval_fallback_when_no_callback_server(self):
+        """When callback server isn't running, returns failure."""
+        self.adapter._callback_runner = None
+        result = await self.adapter.send_exec_approval(
+            chat_id="chan_1",
+            command="ls",
+            session_key="agent:main:chan_1:123",
+        )
+        assert result.success is False
+
+
+class TestMattermostSendSlashConfirm(_InteractiveTestBase):
+    @pytest.mark.asyncio
+    async def test_send_slash_confirm_sends_buttons(self):
+        """send_slash_confirm sends three buttons: Approve Once, Always, Cancel."""
+        self.adapter._api_post = AsyncMock(return_value={"id": "confirm_post"})
+
+        result = await self.adapter.send_slash_confirm(
+            chat_id="chan_1",
+            title="Run Command?",
+            message="Are you sure?",
+            session_key="agent:main:chan_1:123",
+            confirm_id="confirm_abc",
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args[0][1]
+        actions = payload["attachments"][0]["actions"]
+        assert len(actions) == 3
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_fallback(self):
+        """Without callback server, returns failure."""
+        self.adapter._callback_runner = None
+        result = await self.adapter.send_slash_confirm(
+            chat_id="chan_1",
+            title="Test",
+            message="Test",
+            session_key="key",
+            confirm_id="cid",
+        )
+        assert result.success is False
+
+
+class TestMattermostSendClarify(_InteractiveTestBase):
+    @pytest.mark.asyncio
+    async def test_send_clarify_with_choices_sends_buttons(self):
+        """send_clarify with options sends one button per choice plus 'Other'."""
+        self.adapter._api_post = AsyncMock(return_value={"id": "clarify_post"})
+
+        result = await self.adapter.send_clarify(
+            chat_id="chan_1",
+            question="Pick one?",
+            choices=["A", "B", "C"],
+            clarify_id="clarify_1",
+            session_key="agent:main:chan_1:123",
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args[0][1]
+        actions = payload["attachments"][0]["actions"]
+        # 3 choices + 1 "Other" = 4
+        assert len(actions) == 4
+
+    @pytest.mark.asyncio
+    async def test_send_clarify_open_ended_falls_back(self):
+        """send_clarify without choices falls back to base class (no attachments)."""
+        from gateway.platforms.base import BasePlatformAdapter
+        self.adapter._api_post = AsyncMock(return_value={"id": "clarify_post2"})
+        # Stub the base class method to prove the fallback happens
+        with patch.object(BasePlatformAdapter, "send_clarify", new=AsyncMock(return_value=MagicMock(success=True))):
+            result = await self.adapter.send_clarify(
+                chat_id="chan_1",
+                question="What do you think?",
+                choices=None,
+                clarify_id="clarify_2",
+                session_key="agent:main:chan_1:123",
+            )
+            assert result.success is True
+            BasePlatformAdapter.send_clarify.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_send_clarify_fallback(self):
+        """Without callback server, returns failure."""
+        self.adapter._callback_runner = None
+        result = await self.adapter.send_clarify(
+            chat_id="chan_1",
+            question="Q",
+            choices=["A", "B"],
+            clarify_id="cid",
+            session_key="key",
+        )
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_send_clarify_cleans_invalid_choices(self):
+        """Invalid (None, empty) choices are filtered out."""
+        self.adapter._api_post = AsyncMock(return_value={"id": "clarify_post3"})
+        result = await self.adapter.send_clarify(
+            chat_id="chan_1",
+            question="Pick:",
+            choices=["A", "B"],
+            clarify_id="clarify_3",
+            session_key="agent:main:chan_1:123",
+        )
+        assert result.success is True
+        payload = self.adapter._api_post.call_args[0][1]
+        actions = payload["attachments"][0]["actions"]
+        # 2 valid choices + 1 "Other" = 3
+        assert len(actions) == 3
+
+    @pytest.mark.asyncio
+    async def test_send_clarify_caps_at_19_choices(self):
+        """No more than 19 choices (reserve 1 slot for 'Other')."""
+        self.adapter._api_post = AsyncMock(return_value={"id": "clarify_post4"})
+        many_choices = [f"Choice_{i}" for i in range(25)]
+        result = await self.adapter.send_clarify(
+            chat_id="chan_1",
+            question="Pick:",
+            choices=many_choices,
+            clarify_id="clarify_4",
+            session_key="agent:main:chan_1:123",
+        )
+        assert result.success is True
+        payload = self.adapter._api_post.call_args[0][1]
+        actions = payload["attachments"][0]["actions"]
+        # max 19 choices + 1 "Other" = 20 actions
+        assert len(actions) == 20
+
+
+class TestMattermostSendUpdatePrompt(_InteractiveTestBase):
+    @pytest.mark.asyncio
+    async def test_send_update_prompt_sends_yes_no_buttons(self):
+        """send_update_prompt sends Yes and No buttons."""
+        self.adapter._api_post = AsyncMock(return_value={"id": "update_post"})
+
+        result = await self.adapter.send_update_prompt(
+            chat_id="chan_1",
+            prompt="Apply update?",
+            default="y",
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args[0][1]
+        actions = payload["attachments"][0]["actions"]
+        assert len(actions) == 2
+        labels = [a["name"] for a in actions]
+        assert any("Yes" in l or "✓" in l for l in labels)
+        assert any("No" in l or "✗" in l for l in labels)
+
+    @pytest.mark.asyncio
+    async def test_send_update_prompt_fallback(self):
+        """Without callback server, returns failure."""
+        self.adapter._callback_runner = None
+        result = await self.adapter.send_update_prompt(
+            chat_id="chan_1", prompt="Update?", default="y",
+        )
+        assert result.success is False
+
+
+# ---------------------------------------------------------------------------
+# Callback server — action handlers
+# ---------------------------------------------------------------------------
+
+class _CallbackTestBase:
+    """Shared mocks for callback handler tests."""
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        # Mock _api_post and _api_get to prevent real HTTP calls
+        self.adapter._api_post = AsyncMock(return_value={})
+        self.adapter._api_get = AsyncMock(return_value={})
+        self.adapter._bot_user_id = "bot_u_123"
+        self.adapter._bot_username = "hermes-bot"
+
+
+class TestMattermostActionCallbackDispatching(_CallbackTestBase):
+    """Test that the action callback router dispatches to the right handler."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_exec_approval(self):
+        """action_type 'exec_approval' routes to _handle_exec_approval_callback."""
+        self.adapter._handle_exec_approval_callback = AsyncMock()
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "context": {"action_type": "exec_approval", "approval_id": 1},
+            "user_name": "alice",
+        })
+        await self.adapter._action_callback_handler(request)
+        self.adapter._handle_exec_approval_callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_slash_confirm(self):
+        """action_type 'slash_confirm' routes to _handle_slash_confirm_callback."""
+        self.adapter._handle_slash_confirm_callback = AsyncMock()
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "context": {"action_type": "slash_confirm", "confirm_id": "c1"},
+            "user_name": "alice",
+        })
+        await self.adapter._action_callback_handler(request)
+        self.adapter._handle_slash_confirm_callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_clarify(self):
+        """action_type 'clarify' routes to _handle_clarify_callback."""
+        self.adapter._handle_clarify_callback = AsyncMock()
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "context": {"action_type": "clarify", "clarify_id": "cl1"},
+            "user_name": "alice",
+        })
+        await self.adapter._action_callback_handler(request)
+        self.adapter._handle_clarify_callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_update_prompt(self):
+        """action_type 'update_prompt' routes to _handle_update_prompt_callback."""
+        self.adapter._handle_update_prompt_callback = AsyncMock()
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "context": {"action_type": "update_prompt"},
+            "user_name": "alice",
+        })
+        await self.adapter._action_callback_handler(request)
+        self.adapter._handle_update_prompt_callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unknown_action_type_returns_400(self):
+        """Unknown action_type returns a 400 response."""
+        from aiohttp import web
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "context": {"action_type": "unknown_type"},
+            "user_name": "alice",
+        })
+        resp = await self.adapter._action_callback_handler(request)
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_body_returns_400(self):
+        """Invalid JSON in request body returns 400."""
+        request = MagicMock()
+        request.json = AsyncMock(side_effect=ValueError("bad json"))
+        resp = await self.adapter._action_callback_handler(request)
+        assert resp.status == 400
+
+
+class TestMattermostBuildUpdateResponse(_CallbackTestBase):
+    @pytest.mark.asyncio
+    async def test_build_update_response(self):
+        """_build_update_response returns JSON with update message."""
+        resp = await self.adapter._build_update_response("alice", "✅ Approved")
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        assert body["update"]["message"] == "✅ Approved by @alice"
+        assert body["update"]["attachments"] == []
+
+
+class TestMattermostExecApprovalCallback(_CallbackTestBase):
+    @pytest.mark.asyncio
+    async def test_approved_once(self):
+        """Clicking 'Allow Once' resolves approval with choice='once'."""
+        self.adapter._approval_state[1] = "session_key_abc"
+        mock_resolve = MagicMock(return_value=1)
+        with patch("tools.approval.resolve_gateway_approval", mock_resolve):
+            from aiohttp import web
+            request = MagicMock()
+            request.json = AsyncMock(return_value={
+                "context": {
+                    "action_type": "exec_approval",
+                    "approval_id": 1,
+                    "choice": "once",
+                },
+                "user_name": "bob",
+            })
+            resp = await self.adapter._action_callback_handler(request)
+            assert resp.status == 200
+        mock_resolve.assert_called_once_with("session_key_abc", "once")
+
+    @pytest.mark.asyncio
+    async def test_approval_id_missing(self):
+        """Missing approval_id returns 400."""
+        from aiohttp import web
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "context": {"action_type": "exec_approval"},
+            "user_name": "bob",
+        })
+        resp = await self.adapter._action_callback_handler(request)
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_already_resolved_approval(self):
+        """Double-clicking a resolved approval shows 'already resolved' message."""
+        self.adapter._approval_state[1] = "session_key_abc"
+        mock_resolve = MagicMock(return_value=1)
+        with patch("tools.approval.resolve_gateway_approval", mock_resolve):
+            from aiohttp import web
+            request = MagicMock()
+            request.json = AsyncMock(return_value={
+                "context": {
+                    "action_type": "exec_approval",
+                    "approval_id": 1,
+                    "choice": "once",
+                },
+                "user_name": "bob",
+            })
+            # First click: resolves
+            resp1 = await self.adapter._action_callback_handler(request)
+            assert resp1.status == 200
+
+            # Second click: state already popped → "already resolved"
+            resp2 = await self.adapter._action_callback_handler(request)
+            assert resp2.status == 200
+            body2 = json.loads(resp2.body)
+            assert "already been resolved" in body2["update"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_deny_choice(self):
+        """Deny click resolves with choice='deny'."""
+        self.adapter._approval_state[2] = "session_key_xyz"
+        mock_resolve = MagicMock(return_value=0)
+        with patch("tools.approval.resolve_gateway_approval", mock_resolve):
+            from aiohttp import web
+            request = MagicMock()
+            request.json = AsyncMock(return_value={
+                "context": {
+                    "action_type": "exec_approval",
+                    "approval_id": 2,
+                    "choice": "deny",
+                },
+                "user_name": "bob",
+            })
+            resp = await self.adapter._action_callback_handler(request)
+            assert resp.status == 200
+        mock_resolve.assert_called_once_with("session_key_xyz", "deny")
+
+
+class TestMattermostSlashConfirmCallback(_CallbackTestBase):
+    @pytest.mark.asyncio
+    async def test_approve_once(self):
+        """Clicking 'Approve Once' resolves with choice='once'."""
+        self.adapter._slash_confirm_state["cid_1"] = "session_key_1"
+        mock_resolve = AsyncMock(return_value="")
+        with patch("tools.slash_confirm.resolve", mock_resolve):
+            request = MagicMock()
+            request.json = AsyncMock(return_value={
+                "context": {
+                    "action_type": "slash_confirm",
+                    "confirm_id": "cid_1",
+                    "choice": "once",
+                },
+                "user_name": "alice",
+            })
+            resp = await self.adapter._action_callback_handler(request)
+            assert resp.status == 200
+        mock_resolve.assert_called_once_with("session_key_1", "cid_1", "once")
+
+    @pytest.mark.asyncio
+    async def test_always_approve(self):
+        """'Always Approve' resolves with choice='always'."""
+        self.adapter._slash_confirm_state["cid_2"] = "session_key_2"
+        mock_resolve = AsyncMock(return_value="saved")
+        with patch("tools.slash_confirm.resolve", mock_resolve):
+            request = MagicMock()
+            request.json = AsyncMock(return_value={
+                "context": {
+                    "action_type": "slash_confirm",
+                    "confirm_id": "cid_2",
+                    "choice": "always",
+                },
+                "user_name": "bob",
+            })
+            resp = await self.adapter._action_callback_handler(request)
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_missing_confirm_id(self):
+        """Missing confirm_id returns 400."""
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "context": {"action_type": "slash_confirm"},
+            "user_name": "alice",
+        })
+        resp = await self.adapter._action_callback_handler(request)
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_already_resolved_confirm(self):
+        """Already-resolved confirm shows appropriate message."""
+        self.adapter._slash_confirm_state["cid_resolved"] = "session_key"
+        mock_resolve = AsyncMock(return_value="")
+        with patch("tools.slash_confirm.resolve", mock_resolve):
+            request = MagicMock()
+            request.json = AsyncMock(return_value={
+                "context": {
+                    "action_type": "slash_confirm",
+                    "confirm_id": "cid_resolved",
+                    "choice": "cancel",
+                },
+                "user_name": "alice",
+            })
+            # First click
+            await self.adapter._action_callback_handler(request)
+            # Second click — state already popped
+            resp2 = await self.adapter._action_callback_handler(request)
+            assert resp2.status == 200
+            body2 = json.loads(resp2.body)
+            assert "already been resolved" in body2["update"]["message"]
+
+
+class TestMattermostClarifyCallback(_CallbackTestBase):
+    @pytest.mark.asyncio
+    async def test_choice_selected(self):
+        """Clicking a choice button resolves with the choice text."""
+        mock_resolve = MagicMock()
+        with patch("tools.clarify_gateway.resolve_gateway_clarify", mock_resolve), \
+             patch("tools.clarify_gateway.mark_awaiting_text") as _mock_mark:
+            request = MagicMock()
+            request.json = AsyncMock(return_value={
+                "context": {
+                    "action_type": "clarify",
+                    "clarify_id": "cl_1",
+                    "response": "Option A",
+                },
+                "user_name": "alice",
+            })
+            resp = await self.adapter._action_callback_handler(request)
+            assert resp.status == 200
+        mock_resolve.assert_called_once_with("cl_1", "Option A")
+
+    @pytest.mark.asyncio
+    async def test_other_choice(self):
+        """'Other' choice marks as awaiting text."""
+        mock_mark = MagicMock()
+        with patch("tools.clarify_gateway.mark_awaiting_text", mock_mark), \
+             patch("tools.clarify_gateway.resolve_gateway_clarify") as _mock_resolve:
+            request = MagicMock()
+            request.json = AsyncMock(return_value={
+                "context": {
+                    "action_type": "clarify",
+                    "clarify_id": "cl_2",
+                    "response": "__other__",
+                },
+                "user_name": "alice",
+            })
+            resp = await self.adapter._action_callback_handler(request)
+            assert resp.status == 200
+        mock_mark.assert_called_once_with("cl_2")
+        _mock_resolve.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_clarify_id(self):
+        """Missing clarify_id returns 400."""
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "context": {"action_type": "clarify"},
+            "user_name": "alice",
+        })
+        resp = await self.adapter._action_callback_handler(request)
+        assert resp.status == 400
+
+
+class TestMattermostUpdatePromptCallback(_CallbackTestBase):
+    @pytest.mark.asyncio
+    async def test_yes_choice(self):
+        """Yes button returns appropriate update message."""
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "context": {"action_type": "update_prompt", "choice": "y"},
+            "user_name": "alice",
+        })
+        resp = await self.adapter._action_callback_handler(request)
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        assert "Yes" in body["update"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_no_choice(self):
+        """No button returns appropriate update message."""
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "context": {"action_type": "update_prompt", "choice": "n"},
+            "user_name": "bob",
+        })
+        resp = await self.adapter._action_callback_handler(request)
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        assert "No" in body["update"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# _resolve_root_id
+# ---------------------------------------------------------------------------
+
+class TestMattermostResolveRootId:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_resolve_root_id_with_root_returns_root(self):
+        """When the API returns a root_id, it should be returned."""
+        self.adapter._api_get = AsyncMock(return_value={"root_id": "root_post_789"})
+        result = await self.adapter._resolve_root_id("child_post_123")
+        assert result == "root_post_789"
+
+    @pytest.mark.asyncio
+    async def test_resolve_root_id_without_root_returns_original(self):
+        """When the post has no root_id, the original ID is returned."""
+        self.adapter._api_get = AsyncMock(return_value={"id": "post_123", "root_id": ""})
+        result = await self.adapter._resolve_root_id("post_123")
+        assert result == "post_123"
+
+    @pytest.mark.asyncio
+    async def test_resolve_root_id_empty_input(self):
+        """Empty post_id is returned as-is."""
+        result = await self.adapter._resolve_root_id("")
+        assert result == ""
