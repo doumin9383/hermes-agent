@@ -938,6 +938,10 @@ class SessionStore:
                 "source": source.platform.value,
                 "user_id": source.user_id,
             }
+            # Record parent_session_id so auto-reset continuity can load
+            # the previous session's recent messages via lineage.
+            if db_end_session_id:
+                db_create_kwargs["parent_session_id"] = db_end_session_id
 
         # SQLite operations outside the lock
         if self._db and db_end_session_id:
@@ -1294,17 +1298,31 @@ class SessionStore:
             except Exception as e:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
 
-    def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
-        """Load all messages from a session's transcript.
+    def load_transcript(
+        self,
+        session_id: str,
+        include_ancestors: bool = False,
+        max_ancestor_messages: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Load messages from a session's transcript.
 
-        state.db is the canonical store. The legacy JSONL fallback was removed
-        in spec 002 — pre-DB sessions on existing disks have already been
-        migrated (their DB row holds the full message history).
+        Args:
+            session_id: The session to load.
+            include_ancestors: When True, also load messages from parent sessions
+                in the session lineage (for auto-reset continuity).
+            max_ancestor_messages: If > 0, limit the combined transcript to this
+                many most-recent messages when loading from lineage.  Applied as
+                a suffix cap so recent context survives.
         """
         if not self._db:
             return []
         try:
-            return self._db.get_messages_as_conversation(session_id)
+            messages = self._db.get_messages_as_conversation(
+                session_id, include_ancestors=include_ancestors,
+            )
+            if include_ancestors and max_ancestor_messages > 0 and len(messages) > max_ancestor_messages:
+                messages = messages[-max_ancestor_messages:]
+            return messages
         except Exception as e:
             logger.debug("Could not load messages from DB: %s", e)
             return []
