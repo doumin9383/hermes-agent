@@ -1238,3 +1238,312 @@ class TestRewriteTranscriptPreservesReasoning:
             "before user",
             "before assistant",
         ]
+
+
+class TestAutoResetContinuity:
+    """Tests for auto-reset session continuity via parent_session_id lineage.
+
+    When a session is auto-reset (idle/daily timeout), the new session should
+    record parent_session_id so that load_transcript(include_ancestors=True)
+    can recover recent messages from the previous session.
+    """
+
+    def _make_source(self, chat_id="ch1", thread_id=None):
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            chat_type="channel",
+            user_id="user1",
+            user_name="testuser",
+            thread_id=thread_id,
+        )
+
+    def _make_old_entry(self, session_key, session_id, updated_at_delta_hours=-48):
+        """Create a SessionEntry that looks like it expired (idle > 24h)."""
+        from datetime import datetime, timedelta
+        from gateway.session import SessionEntry
+        stale = datetime.now() - timedelta(hours=updated_at_delta_hours)
+        return SessionEntry(
+            session_key=session_key,
+            session_id=session_id,
+            created_at=stale,
+            updated_at=stale,
+            origin=self._make_source(),
+            platform=Platform.TELEGRAM,
+            chat_type="channel",
+            total_tokens=100,
+        )
+
+    def test_parent_session_id_saved_on_idle_reset(self, tmp_path, monkeypatch):
+        """Idle auto-reset should record parent_session_id in the new session."""
+        from datetime import datetime, timedelta
+        from hermes_state import SessionDB
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        from gateway.session import SessionEntry
+
+        source = self._make_source()
+        session_key = build_session_key(source)
+        old_session_id = "old_session_idle"
+
+        # Force idle-reset policy with a 1-minute idle timeout
+        config = GatewayConfig()
+        from gateway.config import SessionResetPolicy
+        config.reset_by_platform[Platform.TELEGRAM] = SessionResetPolicy(
+            mode="idle", idle_minutes=1,
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+
+        # Manually inject a stale entry (2 hours ago → exceeds 1-min timeout)
+        stale = SessionEntry(
+            session_key=session_key,
+            session_id=old_session_id,
+            created_at=datetime.now() - timedelta(hours=2),
+            updated_at=datetime.now() - timedelta(hours=2),
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="channel",
+            total_tokens=100,
+        )
+        store._entries[session_key] = stale
+        store._save()
+        if store._db:
+            store._db.create_session(session_id=old_session_id, source="telegram")
+
+        # get_or_create_session should auto-reset and create a new session
+        new_entry = store.get_or_create_session(source)
+        assert new_entry.session_id != old_session_id, (
+            f"expected different session_id, got same '{new_entry.session_id}'"
+        )
+        assert new_entry.was_auto_reset is True
+
+        # Verify parent_session_id was recorded in the DB
+        if store._db:
+            row = store._db._conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = ?",
+                (new_entry.session_id,),
+            ).fetchone()
+            assert row is not None, "session should exist in DB"
+            assert row["parent_session_id"] == old_session_id, (
+                f"expected parent_session_id={old_session_id}, got {row['parent_session_id']}"
+            )
+
+    def test_parent_session_id_saved_on_daily_reset(self, tmp_path, monkeypatch):
+        """Daily-reset sessions should also record parent_session_id."""
+        from hermes_state import SessionDB
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+        source = self._make_source()
+        session_key = build_session_key(source)
+        old_session_id = "old_session_daily"
+
+        # Force daily-reset policy
+        config = GatewayConfig()
+        from gateway.config import SessionResetPolicy
+        config.reset_by_platform[Platform.TELEGRAM] = SessionResetPolicy(
+            mode="daily", at_hour=0,  # reset at midnight
+        )
+
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+
+        # Create an entry updated yesterday → should trigger daily reset
+        from datetime import datetime, timedelta
+        yesterday = datetime.now() - timedelta(days=1)
+        from gateway.session import SessionEntry
+        stale = SessionEntry(
+            session_key=session_key,
+            session_id=old_session_id,
+            created_at=yesterday,
+            updated_at=yesterday,
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="channel",
+            total_tokens=100,
+        )
+        store._entries[session_key] = stale
+        store._save()
+        # Create parent session in DB to satisfy FK constraint
+        if store._db:
+            store._db.create_session(session_id=old_session_id, source="telegram")
+
+        new_entry = store.get_or_create_session(source)
+        assert new_entry.was_auto_reset is True
+
+        if store._db:
+            row = store._db._conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = ?",
+                (new_entry.session_id,),
+            ).fetchone()
+            assert row is not None
+            assert row["parent_session_id"] == old_session_id
+
+    def test_parent_session_id_not_saved_on_manual_new(self, tmp_path, monkeypatch):
+        """Manual /new or /reset should NOT record parent_session_id."""
+        from hermes_state import SessionDB
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+        source = self._make_source()
+        session_key = build_session_key(source)
+        old_session_id = "old_session_manual"
+
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+
+        stale = self._make_old_entry(session_key, old_session_id)
+        store._entries[session_key] = stale
+        store._save()
+
+        # force_new=True → explicit reset (like /new), no auto-reset
+        new_entry = store.get_or_create_session(source, force_new=True)
+        assert new_entry.session_id != old_session_id
+        assert new_entry.was_auto_reset is False
+
+        if store._db:
+            row = store._db._conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = ?",
+                (new_entry.session_id,),
+            ).fetchone()
+            assert row is not None
+            assert row["parent_session_id"] is None, (
+                "manual reset should NOT set parent_session_id"
+            )
+
+    def test_load_transcript_with_include_ancestors(self, tmp_path, monkeypatch):
+        """load_transcript(include_ancestors=True) should return messages
+        from both the current session and its parent lineage."""
+        from hermes_state import SessionDB
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+
+        parent_id = "parent_session"
+        child_id = "child_session"
+        store._db.create_session(
+            session_id=parent_id, source="test",
+        )
+
+        # Write messages to parent session
+        for msg in [
+            {"role": "user", "content": "parent hello"},
+            {"role": "assistant", "content": "parent hi"},
+        ]:
+            store._db.append_message(
+                session_id=parent_id,
+                role=msg["role"],
+                content=msg["content"],
+            )
+
+        # Create child session WITH parent_session_id lineage
+        store._db.create_session(
+            session_id=child_id,
+            source="test",
+            parent_session_id=parent_id,
+        )
+        # Write a message to child session
+        store._db.append_message(
+            session_id=child_id,
+            role="user",
+            content="child message",
+        )
+
+        # Without include_ancestors: only child messages
+        child_only = store.load_transcript(child_id, include_ancestors=False)
+        contents = [m["content"] for m in child_only if m.get("role") != "session_meta"]
+        assert contents == ["child message"], f"expected only child msg, got {contents}"
+
+        # With include_ancestors: parent + child messages
+        with_ancestors = store.load_transcript(child_id, include_ancestors=True)
+        anc_contents = [m["content"] for m in with_ancestors if m.get("role") != "session_meta"]
+        assert "parent hello" in anc_contents, f"parent message not found: {anc_contents}"
+        assert "parent hi" in anc_contents, f"parent assistant msg not found: {anc_contents}"
+        assert "child message" in anc_contents, f"child message not found: {anc_contents}"
+        # Parent messages should come before child
+        assert anc_contents.index("parent hello") < anc_contents.index("child message")
+
+    def test_load_transcript_respects_max_ancestor_messages(self, tmp_path, monkeypatch):
+        """load_transcript with max_ancestor_messages should cap total messages."""
+        from hermes_state import SessionDB
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+
+        parent_id = "parent_max_test"
+        child_id = "child_max_test"
+
+        store._db.create_session(session_id=parent_id, source="test")
+        # Add 5 messages to parent
+        for i in range(5):
+            store._db.append_message(
+                session_id=parent_id, role="user" if i % 2 == 0 else "assistant",
+                content=f"parent msg {i}",
+            )
+
+        store._db.create_session(
+            session_id=child_id, source="test", parent_session_id=parent_id,
+        )
+        # Add 1 message to child
+        store._db.append_message(
+            session_id=child_id, role="user", content="child msg",
+        )
+
+        # With max_ancestor_messages=3: should see only the 3 most recent messages
+        capped = store.load_transcript(
+            child_id, include_ancestors=True, max_ancestor_messages=3,
+        )
+        capped_contents = [m["content"] for m in capped if m.get("role") != "session_meta"]
+        assert len(capped_contents) <= 3, f"expected ≤3 messages, got {len(capped_contents)}: {capped_contents}"
+        # The most recent message should be the child's, and the cap should take
+        # the last 3 of the combined list.
+        assert "child msg" in capped_contents, f"child message not in capped: {capped_contents}"
+
+    def test_normal_get_or_create_preserves_existing_session(self, tmp_path, monkeypatch):
+        """A session that hasn't expired should return the existing entry unchanged."""
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+        source = self._make_source()
+        session_key = build_session_key(source)
+
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+
+        entry1 = store.get_or_create_session(source)
+        # Same source, same key → should return same entry
+        entry2 = store.get_or_create_session(source)
+        assert entry2.session_id == entry1.session_id
+        assert entry2.was_auto_reset is False
+
+    def test_ancestor_limit_default_off_for_regular_load(self, tmp_path, monkeypatch):
+        """Regular load_transcript (non-ancestor) should not apply the cap."""
+        from hermes_state import SessionDB
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+
+        sid = "regular_session"
+        store._db.create_session(session_id=sid, source="test")
+        for i in range(10):
+            store._db.append_message(
+                session_id=sid, role="user" if i % 2 == 0 else "assistant",
+                content=f"msg {i}",
+            )
+
+        # Without include_ancestors, max_ancestor_messages should be ignored
+        all_msgs = store.load_transcript(sid, include_ancestors=False, max_ancestor_messages=3)
+        contents = [m["content"] for m in all_msgs if m.get("role") != "session_meta"]
+        assert len(contents) == 10, f"expected all 10 messages, got {len(contents)}"
