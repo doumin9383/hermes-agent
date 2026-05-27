@@ -8026,67 +8026,19 @@ class GatewayRunner:
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
         
-        # If the previous session expired and was auto-reset, prepend a notice
-        # so the agent knows this is a fresh conversation (not an intentional /reset).
+        # If the previous session expired and was auto-reset, note the
+        # reason for the notification block below.  The context note
+        # ([[System note: ...]]) is built AFTER history loading so we
+        # can report whether lineage recovery succeeded or not.
         if getattr(session_entry, 'was_auto_reset', False):
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
-            if reset_reason == "suspended":
-                context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
-            elif reset_reason == "daily":
-                context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
-            else:
-                context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
-            context_prompt = context_note + "\n\n" + context_prompt
 
-            # Send a user-facing notification explaining the reset, unless:
-            # - notifications are disabled in config
-            # - the platform is excluded (e.g. api_server, webhook)
-            # - the expired session had no activity (nothing was cleared)
-            try:
-                policy = self.session_store.config.get_reset_policy(
-                    platform=source.platform,
-                    session_type=getattr(source, 'chat_type', 'dm'),
-                )
-                platform_name = source.platform.value if source.platform else ""
-                had_activity = getattr(session_entry, 'reset_had_activity', False)
-                # Suspended sessions always notify (they were explicitly stopped
-                # or crashed mid-operation) — skip the policy check.
-                should_notify = reset_reason == "suspended" or (
-                    policy.notify
-                    and had_activity
-                    and platform_name not in policy.notify_exclude_platforms
-                )
-                if should_notify:
-                    adapter = self.adapters.get(source.platform)
-                    if adapter:
-                        if reset_reason == "suspended":
-                            reason_text = "previous session was stopped or interrupted"
-                        elif reset_reason == "daily":
-                            reason_text = f"daily schedule at {policy.at_hour}:00"
-                        else:
-                            hours = policy.idle_minutes // 60
-                            mins = policy.idle_minutes % 60
-                            duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
-                            reason_text = f"inactive for {duration}"
-                        notice = (
-                            f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
-                            f"Adjust reset timing in config.yaml under session_reset."
-                        )
-                        try:
-                            session_info = self._format_session_info()
-                            if session_info:
-                                notice = f"{notice}\n\n{session_info}"
-                        except Exception:
-                            pass
-                        await adapter.send(
-                            source.chat_id, notice,
-                            metadata=self._thread_metadata_for_source(source),
-                        )
-            except Exception as e:
-                logger.debug("Auto-reset notification failed (non-fatal): %s", e)
+        # NOTE: the user-facing notification (notice) and context note
+        # are now both sent AFTER the history loading block below so we
+        # can report whether lineage recovery succeeded or not.
 
+        # Reset auto-reset flags after consumption
+        if getattr(session_entry, 'was_auto_reset', False):
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
 
@@ -8126,8 +8078,77 @@ class GatewayRunner:
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
-        # Load conversation history from transcript
-        history = self.session_store.load_transcript(session_entry.session_id)
+        # Load conversation history from transcript.
+        # For auto-reset sessions, include parent session messages (lineage)
+        # so the agent doesn't lose sight of the recent conversation.
+        _is_auto_reset = getattr(session_entry, 'was_auto_reset', False)
+        history = self.session_store.load_transcript(
+            session_entry.session_id,
+            include_ancestors=_is_auto_reset,
+            max_ancestor_messages=50 if _is_auto_reset else 0,
+        )
+
+        # Build the auto-reset context note AFTER history loading so we can
+        # report whether lineage recovery succeeded.
+        if _is_auto_reset:
+            _had_activity = getattr(session_entry, 'reset_had_activity', False)
+            _reason = reset_reason  # set above in the was_auto_reset block
+
+            if _reason == "suspended":
+                _note = (
+                    "[System note: The user's previous session was stopped "
+                    "and suspended. This is a fresh conversation with no "
+                    "prior context.]"
+                )
+            elif _had_activity and history:
+                _note = (
+                    f"[System note: The previous session expired ({_reason} "
+                    f"reset). The recent conversation context has been "
+                    f"restored from the previous session. This is a "
+                    f"continuation of the previous conversation.]"
+                )
+            else:
+                _note = (
+                    f"[System note: The previous session expired ({_reason} "
+                    f"reset). No previous conversation context could be "
+                    f"restored. This is a fresh conversation with no prior "
+                    f"context.]"
+                )
+            context_prompt = _note + "\n\n" + context_prompt
+
+            # Also update the user-facing notice to reflect recovery state.
+            if _reason != "suspended":
+                try:
+                    _notice_adapter = self.adapters.get(source.platform)
+                    if _notice_adapter:
+                        if _had_activity and history:
+                            _notice_text = (
+                                f"◐ Session automatically reset ({_reason} reset). "
+                                f"Recent conversation context restored. "
+                                f"Continuing previous conversation.\n"
+                                f"Use /resume to browse and restore a specific "
+                                f"earlier session.\n"
+                                f"Adjust reset timing in config.yaml under "
+                                f"session_reset."
+                            )
+                        else:
+                            _notice_text = (
+                                f"◐ Session automatically reset ({_reason} reset). "
+                                f"Conversation history cleared.\n"
+                                f"Use /resume to browse and restore a previous "
+                                f"session.\n"
+                                f"Adjust reset timing in config.yaml under "
+                                f"session_reset."
+                            )
+                        _session_info = self._format_session_info()
+                        if _session_info:
+                            _notice_text = f"{_notice_text}\n\n{_session_info}"
+                        await _notice_adapter.send(
+                            source.chat_id, _notice_text,
+                            metadata=self._thread_metadata_for_source(source),
+                        )
+                except Exception as _e:
+                    logger.debug("Auto-reset notification update failed (non-fatal): %s", _e)
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
