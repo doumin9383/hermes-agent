@@ -1463,6 +1463,9 @@ class MattermostAdapter(BasePlatformAdapter):
                     "message": "\n".join(caption_parts),
                     "file_ids": file_ids,
                 }
+                root_id = self._thread_root_id(None, metadata)
+                if root_id:
+                    payload["root_id"] = root_id
                 logger.info(
                     "Mattermost: sending %d image(s) as single post (chunk %d/%d)",
                     len(file_ids), chunk_idx + 1, len(chunks),

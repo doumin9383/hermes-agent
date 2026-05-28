@@ -291,6 +291,33 @@ class TestMattermostSend:
         assert payload["file_ids"] == ["file_123"]
 
     @pytest.mark.asyncio
+    async def test_send_multiple_images_with_metadata_thread_id(self, tmp_path):
+        """Batched image posts should route metadata.thread_id to Mattermost root_id."""
+        self.adapter._reply_mode = "thread"
+        image_path = tmp_path / "result.png"
+        image_path.write_bytes(b"png")
+
+        self.adapter._upload_file = AsyncMock(return_value="file_img")
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"id": "post_images"})
+        mock_resp.text = AsyncMock(return_value="")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        self.adapter._session.post = MagicMock(return_value=mock_resp)
+
+        await self.adapter.send_multiple_images(
+            "channel_1",
+            [(f"file://{image_path}", "result")],
+            metadata={"thread_id": "root_from_metadata"},
+        )
+
+        payload = self.adapter._session.post.call_args[1]["json"]
+        assert payload["root_id"] == "root_from_metadata"
+        assert payload["file_ids"] == ["file_img"]
+
+    @pytest.mark.asyncio
     async def test_send_without_thread_no_root_id(self):
         """When reply_mode is 'off', reply_to should NOT set root_id."""
         self.adapter._reply_mode = "off"
