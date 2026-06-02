@@ -1669,7 +1669,16 @@ class BasePlatformAdapter(ABC):
         thread replies without explicit mentions).
         """
         self._session_store = session_store
-    
+
+    async def _on_message_queued(self, event: MessageEvent) -> None:
+        """Called when a message is queued because the session is busy.
+
+        Subclasses can override this to show the user a visual
+        acknowledgment (e.g., a reaction emoji on Mattermost, or
+        an ephemeral message on Discord/Telegram).
+        """
+        pass
+
     @abstractmethod
     async def connect(self) -> bool:
         """
@@ -3336,8 +3345,9 @@ class BasePlatformAdapter(ABC):
                     event,
                     merge_text=event.message_type == MessageType.TEXT,
                 )
+            await self._on_message_queued(event)
             return  # Don't process now - will be handled after current task finishes
-        
+
         # Mark session as active BEFORE spawning background task to close
         # the race window where a second message arriving before the task
         # starts would also pass the _active_sessions check and spawn a

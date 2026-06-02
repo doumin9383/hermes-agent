@@ -68,7 +68,7 @@ _CALLBACK_READ_TIMEOUT_SECONDS = 10.0
 # When MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL is set, the adapter registers
 # all gateway-available slash commands from COMMAND_REGISTRY via the
 # Mattermost REST API so they appear in the / autocomplete dropdown.
-_SLASH_WEBHOOK_DEFAULT_HOST = "127.0.0.1"
+_SLASH_WEBHOOK_DEFAULT_HOST = "0.0.0.0"
 _SLASH_WEBHOOK_DEFAULT_PORT = 8645
 _SLASH_WEBHOOK_PATH = "/mattermost/slash"
 
@@ -1192,6 +1192,33 @@ class MattermostAdapter(BasePlatformAdapter):
                 deleted, len(self._registered_slash_command_ids),
             )
         self._registered_slash_command_ids.clear()
+
+    async def _add_reaction(
+        self, post_id: str, emoji_name: str,
+    ) -> bool:
+        """Add a reaction emoji to a post.
+
+        Calls ``POST /api/v4/posts/{post_id}/reactions``.
+        Returns True if the reaction was added successfully.
+        """
+        if not post_id or not self._bot_user_id:
+            return False
+        payload = {
+            "user_id": self._bot_user_id,
+            "post_id": post_id,
+            "emoji_name": emoji_name.lstrip(":").rstrip(":"),
+        }
+        result = await self._api_post(f"posts/{post_id}/reactions", payload)
+        return bool(result)
+
+    async def _on_message_queued(self, event: MessageEvent) -> None:
+        """Acknowledge queued messages with an hourglass reaction."""
+        if not event.message_id:
+            return
+        try:
+            await self._add_reaction(event.message_id, "hourglass_flowing_sand")
+        except Exception as exc:
+            logger.debug("Mattermost: failed to add queue reaction: %s", exc)
 
     async def send_image(
         self,

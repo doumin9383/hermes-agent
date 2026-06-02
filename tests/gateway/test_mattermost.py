@@ -1,4 +1,5 @@
 """Tests for Mattermost platform adapter."""
+import asyncio
 import json
 import os
 import time
@@ -1668,3 +1669,369 @@ class TestMattermostResolveRootId:
         """Empty post_id is returned as-is."""
         result = await self.adapter._resolve_root_id("")
         assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# Slash command webhook
+# ---------------------------------------------------------------------------
+
+class TestMattermostSlashWebhook:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_start_skipped_when_env_not_set(self):
+        """When MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL is not set, skip."""
+        self.adapter._slash_webhook_public_url = ""
+        await self.adapter._start_slash_webhook()
+        assert self.adapter._slash_app is None
+
+    @pytest.mark.asyncio
+    async def test_start_creates_webhook_server(self):
+        """When env var is set, start aiohttp server on default host:port."""
+        self.adapter._slash_webhook_public_url = "http://mm-host:8645"
+
+        # Use real stubs that support await.
+        class FakeApp:
+            router = MagicMock()
+        class FakeRunner:
+            async def setup(self):
+                pass
+            async def cleanup(self):
+                pass
+
+        with patch("aiohttp.web.Application", return_value=FakeApp()) as MockApp, \
+             patch("aiohttp.web.AppRunner", return_value=FakeRunner()) as MockRunner, \
+             patch("aiohttp.web.TCPSite") as MockSite:
+            instance_site = MockSite.return_value
+            instance_site.start = AsyncMock()
+
+            await self.adapter._start_slash_webhook()
+
+            MockApp.assert_called_once()
+            FakeApp.router.add_post.assert_called_once_with(
+                "/mattermost/slash",
+                self.adapter._handle_slash_webhook,
+            )
+            MockRunner.assert_called_once_with(MockApp.return_value)
+            MockSite.assert_called_once_with(
+                MockRunner.return_value, "0.0.0.0", 8645,
+            )
+            instance_site.start.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_start_with_custom_listen(self):
+        """MATTERMOST_SLASH_WEBHOOK_LISTEN overrides host:port."""
+        self.adapter._slash_webhook_public_url = "http://mm-host:8645"
+        self.adapter._slash_webhook_listen = "10.0.0.1:9999"
+
+        class FakeApp:
+            router = MagicMock()
+        class FakeRunner:
+            async def setup(self): pass
+            async def cleanup(self): pass
+
+        with patch("aiohttp.web.Application", return_value=FakeApp()), \
+             patch("aiohttp.web.AppRunner", return_value=FakeRunner()), \
+             patch("aiohttp.web.TCPSite") as MockSite:
+            instance_site = MockSite.return_value
+            instance_site.start = AsyncMock()
+
+            await self.adapter._start_slash_webhook()
+            MockSite.assert_called_once()
+            call_args = MockSite.call_args[0]
+            assert call_args[1:] == ("10.0.0.1", 9999)
+
+    @pytest.mark.asyncio
+    async def test_stop_webhook_cleans_up(self):
+        """_stop_slash_webhook stops site and cleans up runner."""
+        site_stop = MagicMock()
+        runner_cleanup = MagicMock()
+
+        class FakeSite:
+            async def stop(self):
+                site_stop()
+
+        class FakeRunner:
+            async def cleanup(self):
+                runner_cleanup()
+
+        self.adapter._slash_site = FakeSite()
+        self.adapter._slash_runner = FakeRunner()
+        self.adapter._slash_app = MagicMock()
+
+        await self.adapter._stop_slash_webhook()
+
+        site_stop.assert_called_once()
+        runner_cleanup.assert_called_once()
+        assert self.adapter._slash_site is None
+        assert self.adapter._slash_runner is None
+        assert self.adapter._slash_app is None
+
+
+class TestMattermostSlashRegister:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._bot_user_id = "bot_123"
+
+    @pytest.mark.asyncio
+    async def test_register_skipped_when_env_not_set(self):
+        """When PUBLIC_URL is not set, registration is skipped."""
+        self.adapter._slash_webhook_public_url = ""
+        await self.adapter._register_slash_commands()
+        assert self.adapter._registered_slash_command_ids == []
+
+    @pytest.mark.asyncio
+    async def test_register_with_no_teams(self):
+        """When teams API returns empty, no commands are registered."""
+        self.adapter._slash_webhook_public_url = "http://mm-host:8645"
+        self.adapter._api_get = AsyncMock(return_value=[])
+        await self.adapter._register_slash_commands()
+        assert self.adapter._registered_slash_command_ids == []
+
+    @pytest.mark.asyncio
+    async def test_register_registers_commands_per_team(self):
+        """Commands are registered for each team the bot is in."""
+        self.adapter._slash_webhook_public_url = "http://mm-host:8645"
+        self.adapter._api_get = AsyncMock(return_value=[
+            {"id": "team_a"},
+            {"id": "team_b"},
+        ])
+
+        # The COMMAND_REGISTRY is real; use a small subset that is
+        # gateway-available.  Mock _api_post to succeed for the first
+        # command and return a valid ID.
+        registered_ids = []
+        async def mock_api_post(path, payload):
+            nonlocal registered_ids
+            if path == "commands":
+                registered_ids.append(payload.get("trigger"))
+                return {"id": f"cmd_{len(registered_ids)}"}
+            return {}
+
+        self.adapter._api_post = mock_api_post
+
+        with patch("hermes_cli.commands._is_gateway_available", return_value=True), \
+             patch("hermes_cli.commands._resolve_config_gates", return_value={}):
+            await self.adapter._register_slash_commands()
+
+        # Should have registered at least some commands
+        assert len(self.adapter._registered_slash_command_ids) > 0
+        # ids are stored for cleanup
+        assert all(pid.startswith("cmd_") for pid in self.adapter._registered_slash_command_ids)
+
+    @pytest.mark.asyncio
+    async def test_register_api_failure_logged(self):
+        """When API fails, it's logged and no crash."""
+        self.adapter._slash_webhook_public_url = "http://mm-host:8645"
+        self.adapter._api_get = AsyncMock(return_value=[{"id": "team_a"}])
+        self.adapter._api_post = AsyncMock(return_value={})  # no "id" key -> failure
+
+        with patch("hermes_cli.commands._is_gateway_available", return_value=True), \
+             patch("hermes_cli.commands._resolve_config_gates", return_value={}):
+            await self.adapter._register_slash_commands()
+
+        # No commands registered due to API failure
+        assert self.adapter._registered_slash_command_ids == []
+
+    @pytest.mark.asyncio
+    async def test_cleanup_deletes_registered_commands(self):
+        """Cleanup calls DELETE for each registered command."""
+        self.adapter._registered_slash_command_ids = ["cmd_1", "cmd_2", "cmd_3"]
+        self.adapter._api_delete = AsyncMock(return_value=True)
+
+        await self.adapter._cleanup_slash_commands()
+
+        assert self.adapter._api_delete.call_count == 3
+        self.adapter._api_delete.assert_any_call("commands/cmd_1")
+        self.adapter._api_delete.assert_any_call("commands/cmd_2")
+        self.adapter._api_delete.assert_any_call("commands/cmd_3")
+        assert self.adapter._registered_slash_command_ids == []
+
+    @pytest.mark.asyncio
+    async def test_cleanup_empty_does_nothing(self):
+        """Cleanup with no registered commands does nothing."""
+        self.adapter._api_delete = AsyncMock()
+        await self.adapter._cleanup_slash_commands()
+        self.adapter._api_delete.assert_not_called()
+
+
+class TestMattermostSlashWebhookHandler:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_handle_slash_webhook_valid(self):
+        """Valid slash command creates MessageEvent and calls handle_message."""
+        self.adapter.handle_message = AsyncMock()
+
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "channel_id": "ch_1",
+            "user_id": "user_1",
+            "user_name": "bob",
+            "command": "/help",
+            "text": "slash",
+            "team_id": "team_a",
+        })
+
+        resp = await self.adapter._handle_slash_webhook(request)
+
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        assert "Processing" in body["text"]
+
+        # _handle_slash_webhook uses asyncio.ensure_future to fire
+        # handle_message in the background, so we need to let the
+        # event loop run the scheduled task.
+        await asyncio.sleep(0.01)
+
+        # Verify handle_message was called with a COMMAND message event
+        self.adapter.handle_message.assert_awaited_once()
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/help slash"
+        assert msg_event.message_type.value == "command"
+
+    @pytest.mark.asyncio
+    async def test_handle_slash_webhook_missing_fields(self):
+        """Missing command or channel_id returns 400."""
+        request = MagicMock()
+        request.json = AsyncMock(return_value={
+            "channel_id": "ch_1",
+            # no command
+        })
+
+        resp = await self.adapter._handle_slash_webhook(request)
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_handle_slash_webhook_invalid_json(self):
+        """Invalid JSON body returns 400."""
+        request = MagicMock()
+        request.json = AsyncMock(side_effect=ValueError("bad json"))
+
+        resp = await self.adapter._handle_slash_webhook(request)
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_slash_webhook_connect_flow(self):
+        """connect() tries to start webhook and register commands."""
+        self.adapter._start_slash_webhook = AsyncMock()
+        self.adapter._register_slash_commands = AsyncMock()
+        self.adapter._start_callback_server = AsyncMock()
+        self.adapter._api_get = AsyncMock(return_value={"id": "bot_1"})
+        self.adapter._ws_loop = AsyncMock()
+        self.adapter._session = AsyncMock()
+
+        # Mock the aiohttp session creation
+        import aiohttp
+        with patch.object(aiohttp, "ClientSession") as mock_session_cls:
+            mock_session = AsyncMock()
+            mock_session_cls.return_value = mock_session
+            mock_session.close = AsyncMock()
+
+            result = await self.adapter.connect()
+
+        assert result is True
+        self.adapter._start_slash_webhook.assert_awaited_once()
+        self.adapter._register_slash_commands.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_slash_webhook_disconnect_flow(self):
+        """disconnect() cleans up slash commands and stops webhook."""
+        self.adapter._cleanup_slash_commands = AsyncMock()
+        self.adapter._stop_slash_webhook = AsyncMock()
+        self.adapter._stop_callback_server = AsyncMock()
+        self.adapter._ws = MagicMock()
+        self.adapter._ws.close = AsyncMock()
+        self.adapter._session = AsyncMock()
+        self.adapter._session.closed = False
+        self.adapter._ws_task = None
+        self.adapter._reconnect_task = None
+
+        await self.adapter.disconnect()
+
+        self.adapter._cleanup_slash_commands.assert_awaited_once()
+        self.adapter._stop_slash_webhook.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Reaction / queue acknowledgment
+# ---------------------------------------------------------------------------
+
+class TestMattermostReaction:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._bot_user_id = "bot_123"
+
+    @pytest.mark.asyncio
+    async def test_add_reaction_calls_api(self):
+        """_add_reaction POSTs to the reactions API."""
+        self.adapter._api_post = AsyncMock(return_value={"id": "reaction_1"})
+
+        result = await self.adapter._add_reaction("post_abc", "thumbsup")
+
+        assert result is True
+        self.adapter._api_post.assert_awaited_once_with(
+            "posts/post_abc/reactions",
+            {
+                "user_id": "bot_123",
+                "post_id": "post_abc",
+                "emoji_name": "thumbsup",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_add_reaction_returns_false_on_failure(self):
+        """When API returns empty, reaction is not added."""
+        self.adapter._api_post = AsyncMock(return_value={})
+
+        result = await self.adapter._add_reaction("post_abc", "thumbsup")
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_add_reaction_no_post_id(self):
+        """Empty post_id returns False without API call."""
+        self.adapter._api_post = AsyncMock()
+
+        result = await self.adapter._add_reaction("", "thumbsup")
+
+        assert result is False
+        self.adapter._api_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_add_reaction_strips_colons(self):
+        """Emoji names with colons are normalized."""
+        self.adapter._api_post = AsyncMock(return_value={"id": "r1"})
+
+        await self.adapter._add_reaction("p1", ":hourglass_flowing_sand:")
+
+        payload = self.adapter._api_post.call_args[0][1]
+        assert payload["emoji_name"] == "hourglass_flowing_sand"
+
+    @pytest.mark.asyncio
+    async def test_on_message_queued_adds_reaction(self):
+        """_on_message_queued adds hourglass reaction when message_id is set."""
+        self.adapter._add_reaction = AsyncMock(return_value=True)
+
+        event = MagicMock()
+        event.message_id = "post_789"
+
+        await self.adapter._on_message_queued(event)
+
+        self.adapter._add_reaction.assert_awaited_once_with(
+            "post_789", "hourglass_flowing_sand",
+        )
+
+    @pytest.mark.asyncio
+    async def test_on_message_queued_skips_without_id(self):
+        """_on_message_queued does nothing when message_id is empty."""
+        self.adapter._add_reaction = AsyncMock()
+
+        event = MagicMock()
+        event.message_id = ""
+
+        await self.adapter._on_message_queued(event)
+
+        self.adapter._add_reaction.assert_not_called()
