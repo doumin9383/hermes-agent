@@ -8037,8 +8037,15 @@ class GatewayRunner:
         # are now both sent AFTER the history loading block below so we
         # can report whether lineage recovery succeeded or not.
 
-        # Reset auto-reset flags after consumption
-        if getattr(session_entry, 'was_auto_reset', False):
+        # Save auto-reset flags to locals BEFORE consumption so history
+        # loading (include_ancestors / max_ancestor_messages) and the
+        # auto-reset context note / notification below still see the
+        # correct state despite the entry-level flags being cleared.
+        _was_auto_reset = getattr(session_entry, 'was_auto_reset', False)
+
+        # Reset auto-reset flags after consumption (one-shot — next turn
+        # must not re-trigger lineage recovery).
+        if _was_auto_reset:
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
 
@@ -8081,7 +8088,7 @@ class GatewayRunner:
         # Load conversation history from transcript.
         # For auto-reset sessions, include parent session messages (lineage)
         # so the agent doesn't lose sight of the recent conversation.
-        _is_auto_reset = getattr(session_entry, 'was_auto_reset', False)
+        _is_auto_reset = _was_auto_reset
         history = self.session_store.load_transcript(
             session_entry.session_id,
             include_ancestors=_is_auto_reset,
@@ -11820,6 +11827,8 @@ class GatewayRunner:
 
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /yolo — toggle dangerous command approval bypass for this session only."""
+        if not bool(cfg_get(_load_gateway_config(), "approvals", "allow_yolo", default=True)):
+            return EphemeralReply("YOLO mode is disabled for this gateway.")
         from tools.approval import (
             disable_session_yolo,
             enable_session_yolo,
@@ -13567,6 +13576,9 @@ class GatewayRunner:
         elif any(a in {"session", "ses"} for a in remaining):
             choice = "session"
         else:
+            choice = "once"
+
+        if not bool(cfg_get(_load_gateway_config(), "approvals", "allow_persistent", default=True)):
             choice = "once"
 
         count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)

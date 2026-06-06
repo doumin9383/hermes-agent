@@ -1672,119 +1672,25 @@ class TestMattermostResolveRootId:
 
 
 # ---------------------------------------------------------------------------
-# Slash command webhook
+# Slash command webhook handler (endpoint is on callback server)
 # ---------------------------------------------------------------------------
-
-class TestMattermostSlashWebhook:
-    def setup_method(self):
-        self.adapter = _make_adapter()
-
-    @pytest.mark.asyncio
-    async def test_start_skipped_when_env_not_set(self):
-        """When MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL is not set, skip."""
-        self.adapter._slash_webhook_public_url = ""
-        await self.adapter._start_slash_webhook()
-        assert self.adapter._slash_app is None
-
-    @pytest.mark.asyncio
-    async def test_start_creates_webhook_server(self):
-        """When env var is set, start aiohttp server on default host:port."""
-        self.adapter._slash_webhook_public_url = "http://mm-host:8645"
-
-        # Use real stubs that support await.
-        class FakeApp:
-            router = MagicMock()
-        class FakeRunner:
-            async def setup(self):
-                pass
-            async def cleanup(self):
-                pass
-
-        with patch("aiohttp.web.Application", return_value=FakeApp()) as MockApp, \
-             patch("aiohttp.web.AppRunner", return_value=FakeRunner()) as MockRunner, \
-             patch("aiohttp.web.TCPSite") as MockSite:
-            instance_site = MockSite.return_value
-            instance_site.start = AsyncMock()
-
-            await self.adapter._start_slash_webhook()
-
-            MockApp.assert_called_once()
-            FakeApp.router.add_post.assert_called_once_with(
-                "/mattermost/slash",
-                self.adapter._handle_slash_webhook,
-            )
-            MockRunner.assert_called_once_with(MockApp.return_value)
-            MockSite.assert_called_once_with(
-                MockRunner.return_value, "0.0.0.0", 8645,
-            )
-            instance_site.start.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_start_with_custom_listen(self):
-        """MATTERMOST_SLASH_WEBHOOK_LISTEN overrides host:port."""
-        self.adapter._slash_webhook_public_url = "http://mm-host:8645"
-        self.adapter._slash_webhook_listen = "10.0.0.1:9999"
-
-        class FakeApp:
-            router = MagicMock()
-        class FakeRunner:
-            async def setup(self): pass
-            async def cleanup(self): pass
-
-        with patch("aiohttp.web.Application", return_value=FakeApp()), \
-             patch("aiohttp.web.AppRunner", return_value=FakeRunner()), \
-             patch("aiohttp.web.TCPSite") as MockSite:
-            instance_site = MockSite.return_value
-            instance_site.start = AsyncMock()
-
-            await self.adapter._start_slash_webhook()
-            MockSite.assert_called_once()
-            call_args = MockSite.call_args[0]
-            assert call_args[1:] == ("10.0.0.1", 9999)
-
-    @pytest.mark.asyncio
-    async def test_stop_webhook_cleans_up(self):
-        """_stop_slash_webhook stops site and cleans up runner."""
-        site_stop = MagicMock()
-        runner_cleanup = MagicMock()
-
-        class FakeSite:
-            async def stop(self):
-                site_stop()
-
-        class FakeRunner:
-            async def cleanup(self):
-                runner_cleanup()
-
-        self.adapter._slash_site = FakeSite()
-        self.adapter._slash_runner = FakeRunner()
-        self.adapter._slash_app = MagicMock()
-
-        await self.adapter._stop_slash_webhook()
-
-        site_stop.assert_called_once()
-        runner_cleanup.assert_called_once()
-        assert self.adapter._slash_site is None
-        assert self.adapter._slash_runner is None
-        assert self.adapter._slash_app is None
-
 
 class TestMattermostSlashRegister:
     def setup_method(self):
         self.adapter = _make_adapter()
         self.adapter._bot_user_id = "bot_123"
+        self.adapter._slash_webhook_url = "http://mm-host:8580/mattermost/slash"
 
     @pytest.mark.asyncio
-    async def test_register_skipped_when_env_not_set(self):
-        """When PUBLIC_URL is not set, registration is skipped."""
-        self.adapter._slash_webhook_public_url = ""
+    async def test_register_skipped_when_url_not_set(self):
+        """When _slash_webhook_url is empty, registration is skipped."""
+        self.adapter._slash_webhook_url = ""
         await self.adapter._register_slash_commands()
         assert self.adapter._registered_slash_command_ids == []
 
     @pytest.mark.asyncio
     async def test_register_with_no_teams(self):
         """When teams API returns empty, no commands are registered."""
-        self.adapter._slash_webhook_public_url = "http://mm-host:8645"
         self.adapter._api_get = AsyncMock(return_value=[])
         await self.adapter._register_slash_commands()
         assert self.adapter._registered_slash_command_ids == []
@@ -1792,7 +1698,6 @@ class TestMattermostSlashRegister:
     @pytest.mark.asyncio
     async def test_register_registers_commands_per_team(self):
         """Commands are registered for each team the bot is in."""
-        self.adapter._slash_webhook_public_url = "http://mm-host:8645"
         self.adapter._api_get = AsyncMock(return_value=[
             {"id": "team_a"},
             {"id": "team_b"},
@@ -1823,7 +1728,6 @@ class TestMattermostSlashRegister:
     @pytest.mark.asyncio
     async def test_register_api_failure_logged(self):
         """When API fails, it's logged and no crash."""
-        self.adapter._slash_webhook_public_url = "http://mm-host:8645"
         self.adapter._api_get = AsyncMock(return_value=[{"id": "team_a"}])
         self.adapter._api_post = AsyncMock(return_value={})  # no "id" key -> failure
 
@@ -1833,6 +1737,26 @@ class TestMattermostSlashRegister:
 
         # No commands registered due to API failure
         assert self.adapter._registered_slash_command_ids == []
+
+    @pytest.mark.asyncio
+    async def test_register_uses_slash_webhook_url(self):
+        """webhook_url in payload is set from _slash_webhook_url, not _slash_webhook_public_url."""
+        self.adapter._api_get = AsyncMock(return_value=[{"id": "team_a"}])
+        captured_urls = []
+
+        async def mock_api_post(path, payload):
+            captured_urls.append(payload.get("url", ""))
+            return {"id": "cmd_1"}
+
+        self.adapter._api_post = mock_api_post
+
+        with patch("hermes_cli.commands._is_gateway_available", return_value=True), \
+             patch("hermes_cli.commands._resolve_config_gates", return_value={}):
+            await self.adapter._register_slash_commands()
+
+        assert len(captured_urls) > 0
+        for url in captured_urls:
+            assert url == "http://mm-host:8580/mattermost/slash"
 
     @pytest.mark.asyncio
     async def test_cleanup_deletes_registered_commands(self):
@@ -1915,8 +1839,7 @@ class TestMattermostSlashWebhookHandler:
 
     @pytest.mark.asyncio
     async def test_slash_webhook_connect_flow(self):
-        """connect() tries to start webhook and register commands."""
-        self.adapter._start_slash_webhook = AsyncMock()
+        """connect() starts callback server and registers commands (no separate webhook)."""
         self.adapter._register_slash_commands = AsyncMock()
         self.adapter._start_callback_server = AsyncMock()
         self.adapter._api_get = AsyncMock(return_value={"id": "bot_1"})
@@ -1933,14 +1856,12 @@ class TestMattermostSlashWebhookHandler:
             result = await self.adapter.connect()
 
         assert result is True
-        self.adapter._start_slash_webhook.assert_awaited_once()
         self.adapter._register_slash_commands.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_slash_webhook_disconnect_flow(self):
-        """disconnect() cleans up slash commands and stops webhook."""
+        """disconnect() cleans up slash commands and stops callback server (no separate webhook)."""
         self.adapter._cleanup_slash_commands = AsyncMock()
-        self.adapter._stop_slash_webhook = AsyncMock()
         self.adapter._stop_callback_server = AsyncMock()
         self.adapter._ws = MagicMock()
         self.adapter._ws.close = AsyncMock()
@@ -1952,7 +1873,6 @@ class TestMattermostSlashWebhookHandler:
         await self.adapter.disconnect()
 
         self.adapter._cleanup_slash_commands.assert_awaited_once()
-        self.adapter._stop_slash_webhook.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

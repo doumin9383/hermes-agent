@@ -1426,6 +1426,10 @@ DEFAULT_CONFIG = {
         "mode": "manual",
         "timeout": 60,
         "cron_mode": "deny",
+        # Disable bypass and approval persistence for privileged gateways.
+        # When allow_persistent is false, session/always approvals apply once.
+        "allow_yolo": True,
+        "allow_persistent": True,
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system

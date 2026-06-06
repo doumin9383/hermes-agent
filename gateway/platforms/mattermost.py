@@ -14,9 +14,8 @@ Environment variables:
     MATTERMOST_CALLBACK_URL             Public URL for Mattermost to POST action callbacks;
                                         auto-derived from host/port when not set
     MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL Public URL for Mattermost to POST slash command
-                                        invocations; when set, enables slash command
-                                        autocomplete via command registration
-    MATTERMOST_SLASH_WEBHOOK_LISTEN     Slash webhook bind address:port (default: 127.0.0.1:8645)
+                                        invocations; auto-derived from MATTERMOST_CALLBACK_URL
+                                        when not set
 """
 
 from __future__ import annotations
@@ -60,16 +59,13 @@ _RECONNECT_JITTER = 0.2
 # Interactive-action callback server.
 _CALLBACK_DEFAULT_PORT = 8580
 _CALLBACK_DEFAULT_HOST = "0.0.0.0"
-_CALLBACK_PATH = "/mattermost/action"
+_CALLBACK_PATH = "/mattermost/actions"
 # How long to wait for the Mattermost POST body before giving up.
 _CALLBACK_READ_TIMEOUT_SECONDS = 10.0
 
-# Slash-command webhook server (autocomplete support).
-# When MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL is set, the adapter registers
-# all gateway-available slash commands from COMMAND_REGISTRY via the
-# Mattermost REST API so they appear in the / autocomplete dropdown.
-_SLASH_WEBHOOK_DEFAULT_HOST = "0.0.0.0"
-_SLASH_WEBHOOK_DEFAULT_PORT = 8645
+# Slash-command webhook endpoint.
+# Shares the callback server (port 8580 by default) — no separate server needed.
+# The URL is auto-derived from MATTERMOST_CALLBACK_URL.
 _SLASH_WEBHOOK_PATH = "/mattermost/slash"
 
 
@@ -140,17 +136,8 @@ class MattermostAdapter(BasePlatformAdapter):
         self._clarify_state: Dict[str, str] = {}       # clarify_id → ... (opaque)
         self._interactive_counter: int = 0
 
-        # Slash-command webhook for autocomplete.
-        self._slash_webhook_public_url: str = os.getenv(
-            "MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL", ""
-        )
-        self._slash_webhook_listen: str = os.getenv(
-            "MATTERMOST_SLASH_WEBHOOK_LISTEN",
-            f"{_SLASH_WEBHOOK_DEFAULT_HOST}:{_SLASH_WEBHOOK_DEFAULT_PORT}",
-        )
-        self._slash_app: Any = None
-        self._slash_runner: Any = None
-        self._slash_site: Any = None
+        # Slash-command registration (shares callback server, no separate webhook).
+        self._slash_webhook_url: str = ""
         self._registered_slash_command_ids: List[str] = []
 
     def _thread_root_id(
@@ -312,7 +299,8 @@ class MattermostAdapter(BasePlatformAdapter):
         # Start WebSocket in background.
         self._ws_task = asyncio.create_task(self._ws_loop())
 
-        # Start the HTTP callback server for interactive actions.
+        # Start the HTTP callback server for interactive actions
+        # (also handles slash-command callbacks via /mattermost/slash).
         try:
             await self._start_callback_server()
         except Exception as exc:
@@ -321,13 +309,7 @@ class MattermostAdapter(BasePlatformAdapter):
                 "interactive buttons will fall back to text: %s", exc,
             )
 
-        # Start slash-command webhook and register commands.
-        try:
-            await self._start_slash_webhook()
-        except Exception as exc:
-            logger.warning(
-                "Mattermost: slash webhook failed to start: %s", exc,
-            )
+        # Register slash commands with Mattermost (webhook is on callback server).
         try:
             await self._register_slash_commands()
         except Exception as exc:
@@ -342,12 +324,11 @@ class MattermostAdapter(BasePlatformAdapter):
         """Disconnect from Mattermost."""
         self._closing = True
 
-        # Stop the callback server first.
+        # Stop the callback server (also handles slash-command webhook).
         await self._stop_callback_server()
 
-        # Clean up slash commands and webhook.
+        # Clean up slash commands.
         await self._cleanup_slash_commands()
-        await self._stop_slash_webhook()
 
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
@@ -468,14 +449,18 @@ class MattermostAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _start_callback_server(self) -> None:
-        """Start the aiohttp HTTP server for interactive action callbacks.
+        """Start the aiohttp HTTP server for interactive action callbacks
+        and slash-command callbacks.
 
         This server receives POST requests from the Mattermost server when
-        a user clicks an interactive message button.  The callback URL is
+        a user clicks an interactive message button, and when a user
+        triggers a registered slash command.  The callback URL is
         either configured explicitly via ``MATTERMOST_CALLBACK_URL`` or
-        derived from the bind host and port.
+        derived from the bind host and port.  The slash webhook URL is
+        auto-derived from the callback URL by substituting the path.
         """
         from aiohttp import web
+        from urllib.parse import urlparse, urlunparse
 
         app = web.Application()
 
@@ -484,6 +469,9 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Action callback endpoint.
         app.router.add_post(_CALLBACK_PATH, self._action_callback_handler)
+
+        # Slash-command callback endpoint (shares the same server).
+        app.router.add_post(_SLASH_WEBHOOK_PATH, self._handle_slash_webhook)
 
         self._callback_app = app
         self._callback_runner = web.AppRunner(app)
@@ -509,6 +497,14 @@ class MattermostAdapter(BasePlatformAdapter):
                 )
         logger.info(
             "Mattermost: callback server ready at %s", self._callback_url,
+        )
+
+        # Auto-derive the slash webhook URL from the callback URL.
+        parsed = urlparse(self._callback_url)
+        self._slash_webhook_url = urlunparse(parsed._replace(path=_SLASH_WEBHOOK_PATH))
+        logger.info(
+            "Mattermost: slash webhook URL derived as %s",
+            self._slash_webhook_url,
         )
 
     async def _stop_callback_server(self) -> None:
@@ -944,74 +940,8 @@ class MattermostAdapter(BasePlatformAdapter):
         )
 
     # ------------------------------------------------------------------
-    # Slash-command webhook (autocomplete)
+    # Slash-command handler (endpoint is on the callback server)
     # ------------------------------------------------------------------
-
-    async def _start_slash_webhook(self) -> None:
-        """Start the aiohttp HTTP server for slash-command callbacks.
-
-        This server receives POST requests from the Mattermost server when
-        a user triggers a registered slash command.  The public URL must be
-        configured via ``MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL``; the feature
-        is disabled when that variable is not set.
-        """
-        if not self._slash_webhook_public_url:
-            logger.info(
-                "Mattermost: MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL not set — "
-                "slash command autocomplete disabled",
-            )
-            return
-
-        from aiohttp import web
-
-        # Parse host:port.
-        listen_parts = self._slash_webhook_listen.rsplit(":", 1)
-        try:
-            host = listen_parts[0].strip() or _SLASH_WEBHOOK_DEFAULT_HOST
-            port = int(listen_parts[1].strip()) if len(listen_parts) > 1 else _SLASH_WEBHOOK_DEFAULT_PORT
-        except (ValueError, IndexError):
-            logger.warning(
-                "Mattermost: invalid MATTERMOST_SLASH_WEBHOOK_LISTEN=%r, "
-                "falling back to %s:%d",
-                self._slash_webhook_listen,
-                _SLASH_WEBHOOK_DEFAULT_HOST,
-                _SLASH_WEBHOOK_DEFAULT_PORT,
-            )
-            host = _SLASH_WEBHOOK_DEFAULT_HOST
-            port = _SLASH_WEBHOOK_DEFAULT_PORT
-
-        app = web.Application()
-        app.router.add_post(_SLASH_WEBHOOK_PATH, self._handle_slash_webhook)
-
-        self._slash_app = app
-        self._slash_runner = web.AppRunner(app)
-        await self._slash_runner.setup()
-        self._slash_site = web.TCPSite(
-            self._slash_runner, host, port,
-        )
-        await self._slash_site.start()
-
-        logger.info(
-            "Mattermost: slash webhook ready at %s (listening on %s:%d)",
-            self._slash_webhook_public_url, host, port,
-        )
-
-    async def _stop_slash_webhook(self) -> None:
-        """Stop the slash-command webhook server."""
-        if self._slash_site:
-            try:
-                await self._slash_site.stop()
-            except Exception as exc:
-                logger.debug("Mattermost: slash site stop: %s", exc)
-            self._slash_site = None
-        if self._slash_runner:
-            try:
-                await self._slash_runner.cleanup()
-            except Exception as exc:
-                logger.debug("Mattermost: slash runner cleanup: %s", exc)
-            self._slash_runner = None
-        self._slash_app = None
-        logger.info("Mattermost: slash webhook stopped")
 
     async def _handle_slash_webhook(self, request: Any) -> Any:
         """Handle an incoming slash-command POST from Mattermost.
@@ -1104,9 +1034,14 @@ class MattermostAdapter(BasePlatformAdapter):
         Registered command IDs are stored so they can be cleaned up on
         disconnect.
 
-        Requires ``MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL`` to be set.
+        The webhook URL is set to ``self._slash_webhook_url``, which is
+        auto-derived from the callback server URL during startup.
         """
-        if not self._slash_webhook_public_url:
+        if not self._slash_webhook_url:
+            logger.info(
+                "Mattermost: slash webhook URL not available — "
+                "slash command autocomplete disabled",
+            )
             return
 
         # Collect gateway-available commands from COMMAND_REGISTRY.
@@ -1132,7 +1067,7 @@ class MattermostAdapter(BasePlatformAdapter):
             return
 
         config_overrides = _resolve_config_gates()
-        webhook_url = f"{self._slash_webhook_public_url}{_SLASH_WEBHOOK_PATH}"
+        webhook_url = self._slash_webhook_url
         registered_count = 0
 
         for team_info in teams_data:

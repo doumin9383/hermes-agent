@@ -389,6 +389,14 @@ DANGEROUS_PATTERNS = [
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
+    # Cluster mutations must always cross the human approval boundary.
+    (r'\bkubectl\b[^\n]*\b(apply|create|delete|replace|patch|edit|scale|autoscale|set|label|annotate|taint|cordon|uncordon|drain|exec|cp|run|expose)\b',
+     "Kubernetes cluster mutation"),
+    (r'\bkubectl\b[^\n]*\brollout\s+(restart|undo)\b', "Kubernetes rollout mutation"),
+    (r'\bkubectl\b[^\n]*\bauth\s+reconcile\b', "Kubernetes RBAC reconciliation"),
+    (r'\bhelm\b[^\n]*\b(install|upgrade|uninstall|rollback)\b', "Helm release mutation"),
+    (r'\bk3s\b[^\n]*\b(ctr|kubectl)\b', "direct k3s administration"),
+    (r'\bcrictl\b[^\n]*\b(rm|rmi|stop|pull|run|create|update|exec)\b', "container runtime mutation"),
     # Script execution after chmod +x — catches the two-step pattern where
     # a script is first made executable then immediately run. The script
     # content may contain dangerous commands that individual patterns miss.
@@ -637,6 +645,8 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     Accept both the current canonical key and the legacy regex-derived key so
     existing command_allowlist entries continue to work after key migrations.
     """
+    if not _persistent_approvals_allowed():
+        return False
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
         if any(alias in _permanent_approved for alias in aliases):
@@ -842,6 +852,21 @@ def _get_approval_mode() -> str:
     return _normalize_approval_mode(mode)
 
 
+def _yolo_allowed() -> bool:
+    return bool(_get_approval_config().get("allow_yolo", True))
+
+
+def _persistent_approvals_allowed() -> bool:
+    return bool(_get_approval_config().get("allow_persistent", True))
+
+
+def normalize_approval_choice(choice: str) -> str:
+    """Downgrade session/permanent approvals when persistence is disabled."""
+    if choice in {"session", "always"} and not _persistent_approvals_allowed():
+        return "once"
+    return choice
+
+
 def _get_approval_timeout() -> int:
     """Read the approval timeout from config. Defaults to 60 seconds."""
     try:
@@ -940,7 +965,7 @@ def check_dangerous_command(command: str, env_type: str,
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
-    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled():
+    if _yolo_allowed() and (is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled()):
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
@@ -988,8 +1013,10 @@ def check_dangerous_command(command: str, env_type: str,
             ),
         }
 
-    choice = prompt_dangerous_approval(command, description,
-                                       approval_callback=approval_callback)
+    choice = normalize_approval_choice(prompt_dangerous_approval(
+        command, description, allow_permanent=_persistent_approvals_allowed(),
+        approval_callback=approval_callback,
+    ))
 
     if choice == "deny":
         return {
@@ -1076,7 +1103,7 @@ def check_all_command_guards(command: str, env_type: str,
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled() or approval_mode == "off":
+    if _yolo_allowed() and (is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled() or approval_mode == "off"):
         return {"approved": True, "message": None}
 
     is_cli = env_var_enabled("HERMES_INTERACTIVE")
@@ -1329,6 +1356,7 @@ def check_all_command_guards(command: str, env_type: str,
                     "user_consent": False,
                 }
 
+            choice = normalize_approval_choice(choice)
             # User approved — persist based on scope (same logic as CLI)
             for key, _, is_tirith in warnings:
                 if choice == "session" or (choice == "always" and is_tirith):
@@ -1374,9 +1402,11 @@ def check_all_command_guards(command: str, env_type: str,
         session_key=session_key,
         surface="cli",
     )
-    choice = prompt_dangerous_approval(command, combined_desc,
-                                       allow_permanent=not has_tirith,
-                                       approval_callback=approval_callback)
+    choice = normalize_approval_choice(prompt_dangerous_approval(
+        command, combined_desc,
+        allow_permanent=not has_tirith and _persistent_approvals_allowed(),
+        approval_callback=approval_callback,
+    ))
     _fire_approval_hook(
         "post_approval_response",
         command=command,
