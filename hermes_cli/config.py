@@ -1430,6 +1430,7 @@ DEFAULT_CONFIG = {
         # When allow_persistent is false, session/always approvals apply once.
         "allow_yolo": True,
         "allow_persistent": True,
+        "fail_closed": False,
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system

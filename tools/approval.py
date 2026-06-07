@@ -857,6 +857,9 @@ def _yolo_allowed() -> bool:
     return bool(_get_approval_config().get("allow_yolo", True))
 
 
+def _fail_closed_without_approval_context() -> bool:
+    return bool(_get_approval_config().get("fail_closed", False))
+
 def _persistent_approvals_allowed() -> bool:
     return bool(_get_approval_config().get("allow_persistent", True))
 
@@ -952,6 +955,8 @@ def check_dangerous_command(command: str, env_type: str,
         {"approved": True/False, "message": str or None, ...}
     """
     if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+        if _fail_closed_without_approval_context():
+            return {"approved": False, "message": f"BLOCKED: Dangerous command requires an interactive approval context ({description})."}
         return {"approved": True, "message": None}
 
     # Hardline floor: commands with no recovery path (rm -rf /, mkfs, dd
@@ -967,14 +972,20 @@ def check_dangerous_command(command: str, env_type: str,
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
     if _yolo_allowed() and (is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled()):
+        if _fail_closed_without_approval_context():
+            return {"approved": False, "message": f"BLOCKED: Dangerous command requires an interactive approval context ({description})."}
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     if not is_dangerous:
+        if _fail_closed_without_approval_context():
+            return {"approved": False, "message": f"BLOCKED: Dangerous command requires an interactive approval context ({description})."}
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
+        if _fail_closed_without_approval_context():
+            return {"approved": False, "message": f"BLOCKED: Dangerous command requires an interactive approval context ({description})."}
         return {"approved": True, "message": None}
 
     is_cli = env_var_enabled("HERMES_INTERACTIVE")
@@ -994,6 +1005,8 @@ def check_dangerous_command(command: str, env_type: str,
                         "approvals.cron_mode: approve in config.yaml."
                     ),
                 }
+        if _fail_closed_without_approval_context():
+            return {"approved": False, "message": f"BLOCKED: Dangerous command requires an interactive approval context ({description})."}
         return {"approved": True, "message": None}
 
     if is_gateway or env_var_enabled("HERMES_EXEC_ASK"):
@@ -1079,6 +1092,8 @@ def check_all_command_guards(command: str, env_type: str,
     """
     # Skip containers for both checks
     if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+        if _fail_closed_without_approval_context():
+            return {"approved": False, "message": f"BLOCKED: Dangerous command requires an interactive approval context ({description})."}
         return {"approved": True, "message": None}
 
     # Hardline floor: unconditional block for catastrophic commands
@@ -1105,6 +1120,8 @@ def check_all_command_guards(command: str, env_type: str,
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
     if _yolo_allowed() and (is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled() or approval_mode == "off"):
+        if _fail_closed_without_approval_context():
+            return {"approved": False, "message": f"BLOCKED: Dangerous command requires an interactive approval context ({description})."}
         return {"approved": True, "message": None}
 
     is_cli = env_var_enabled("HERMES_INTERACTIVE")
@@ -1130,6 +1147,8 @@ def check_all_command_guards(command: str, env_type: str,
                             "approvals.cron_mode: approve in config.yaml."
                         ),
                     }
+        if _fail_closed_without_approval_context():
+            return {"approved": False, "message": f"BLOCKED: Dangerous command requires an interactive approval context ({description})."}
         return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---
@@ -1171,6 +1190,8 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Nothing to warn about
     if not warnings:
+        if _fail_closed_without_approval_context():
+            return {"approved": False, "message": f"BLOCKED: Dangerous command requires an interactive approval context ({description})."}
         return {"approved": True, "message": None}
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
