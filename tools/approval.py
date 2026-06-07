@@ -394,8 +394,7 @@ DANGEROUS_PATTERNS = [
      "Kubernetes cluster mutation"),
     (r'\bkubectl\b[^\n]*\brollout\s+(restart|undo)\b', "Kubernetes rollout mutation"),
     (r'\bkubectl\b[^\n]*\bauth\s+reconcile\b', "Kubernetes RBAC reconciliation"),
-    (r'bkubectlb[^
-]*b(get|describe)s+(secret|secrets)b', "Kubernetes secret read"),
+    (r'\bkubectl\b[^\n]*\b(get|describe)\s+(secret|secrets)\b', "Kubernetes secret read"),
     (r'\bhelm\b[^\n]*\b(install|upgrade|uninstall|rollback)\b', "Helm release mutation"),
     (r'\bk3s\b[^\n]*\b(ctr|kubectl)\b', "direct k3s administration"),
     (r'\bcrictl\b[^\n]*\b(rm|rmi|stop|pull|run|create|update|exec)\b', "container runtime mutation"),
