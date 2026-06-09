@@ -17,6 +17,12 @@ RUN apt-get update && \
     build-essential curl nodejs npm python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git gh openssh-client docker-cli tini && \
     rm -rf /var/lib/apt/lists/*
 
+ARG KUBECTL_VERSION=v1.35.4
+ARG TARGETARCH
+RUN curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release//bin/linux//kubectl" && \
+    chmod 0755 /usr/local/bin/kubectl && \
+    kubectl version --client
+
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
 
