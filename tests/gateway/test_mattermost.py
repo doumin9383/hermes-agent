@@ -1054,7 +1054,7 @@ class _InteractiveTestBase:
 class TestMattermostSendInteractivePost(_InteractiveTestBase):
     @pytest.mark.asyncio
     async def test_send_interactive_basic(self):
-        """_send_interactive_post sends attachments in the payload."""
+        """_send_interactive_post sends attachments under props."""
         self.adapter._api_post = AsyncMock(return_value={"id": "post_int"})
         attachments = [{"title": "Test", "actions": []}]
         result = await self.adapter._send_interactive_post(
@@ -1063,7 +1063,8 @@ class TestMattermostSendInteractivePost(_InteractiveTestBase):
         assert result.success is True
         assert result.message_id == "post_int"
         payload = self.adapter._api_post.call_args[0][1]
-        assert payload["attachments"] == attachments
+        assert payload["props"]["attachments"] == attachments
+        assert "attachments" not in payload
         assert payload["message"] == "Hello"
 
     @pytest.mark.asyncio
@@ -1106,7 +1107,7 @@ class TestMattermostSendExecApproval(_InteractiveTestBase):
         assert result.message_id == "approval_post"
         payload = self.adapter._api_post.call_args[0][1]
         assert payload["channel_id"] == "chan_1"
-        attachments = payload["attachments"]
+        attachments = payload["props"]["attachments"]
         assert len(attachments) == 1
         assert "Command Approval" in attachments[0]["title"]
         actions = attachments[0]["actions"]
@@ -1145,7 +1146,7 @@ class TestMattermostSendExecApproval(_InteractiveTestBase):
 
         assert result.success is True
         payload = self.adapter._api_post.call_args[0][1]
-        text = payload["attachments"][0]["text"]
+        text = payload["props"]["attachments"][0]["text"]
         assert len(text) < 4500
         assert "..." in text
 
@@ -1177,7 +1178,7 @@ class TestMattermostSendSlashConfirm(_InteractiveTestBase):
 
         assert result.success is True
         payload = self.adapter._api_post.call_args[0][1]
-        actions = payload["attachments"][0]["actions"]
+        actions = payload["props"]["attachments"][0]["actions"]
         assert len(actions) == 3
 
     @pytest.mark.asyncio
@@ -1210,7 +1211,7 @@ class TestMattermostSendClarify(_InteractiveTestBase):
 
         assert result.success is True
         payload = self.adapter._api_post.call_args[0][1]
-        actions = payload["attachments"][0]["actions"]
+        actions = payload["props"]["attachments"][0]["actions"]
         # 3 choices + 1 "Other" = 4
         assert len(actions) == 4
 
@@ -1257,7 +1258,7 @@ class TestMattermostSendClarify(_InteractiveTestBase):
         )
         assert result.success is True
         payload = self.adapter._api_post.call_args[0][1]
-        actions = payload["attachments"][0]["actions"]
+        actions = payload["props"]["attachments"][0]["actions"]
         # 2 valid choices + 1 "Other" = 3
         assert len(actions) == 3
 
@@ -1275,7 +1276,7 @@ class TestMattermostSendClarify(_InteractiveTestBase):
         )
         assert result.success is True
         payload = self.adapter._api_post.call_args[0][1]
-        actions = payload["attachments"][0]["actions"]
+        actions = payload["props"]["attachments"][0]["actions"]
         # max 19 choices + 1 "Other" = 20 actions
         assert len(actions) == 20
 
@@ -1294,7 +1295,7 @@ class TestMattermostSendUpdatePrompt(_InteractiveTestBase):
 
         assert result.success is True
         payload = self.adapter._api_post.call_args[0][1]
-        actions = payload["attachments"][0]["actions"]
+        actions = payload["props"]["attachments"][0]["actions"]
         assert len(actions) == 2
         labels = [a["name"] for a in actions]
         assert any("Yes" in l or "✓" in l for l in labels)

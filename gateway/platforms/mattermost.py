@@ -725,7 +725,7 @@ class MattermostAdapter(BasePlatformAdapter):
         payload: Dict[str, Any] = {
             "channel_id": chat_id,
             "message": message,
-            "attachments": attachments,
+            "props": {"attachments": attachments},
         }
         root_id = self._thread_root_id(None, metadata)
         if root_id:
