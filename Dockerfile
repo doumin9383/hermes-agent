@@ -19,7 +19,7 @@ RUN apt-get update && \
 
 ARG KUBECTL_VERSION=v1.35.4
 ARG TARGETARCH
-RUN curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release//bin/linux//kubectl" && \
+RUN curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" && \
     chmod 0755 /usr/local/bin/kubectl && \
     kubectl version --client
 
