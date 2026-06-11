@@ -964,10 +964,16 @@ class MattermostAdapter(BasePlatformAdapter):
         try:
             data = await request.json()
         except Exception:
-            logger.warning("Mattermost: invalid slash webhook body")
-            return web.json_response(
-                {"error": "invalid body"}, status=400,
-            )
+            # Mattermost may send slash command payloads as
+            # application/x-www-form-urlencoded; try that next.
+            try:
+                post_data = await request.post()
+                data = dict(post_data)
+            except Exception:
+                logger.warning("Mattermost: invalid slash webhook body (JSON and form failed)")
+                return web.json_response(
+                    {"error": "invalid body"}, status=400,
+                )
 
         channel_id = data.get("channel_id", "")
         user_id = data.get("user_id", "")

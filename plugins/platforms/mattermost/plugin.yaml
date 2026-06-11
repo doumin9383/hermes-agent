@@ -47,3 +47,19 @@ optional_env:
     description: "If set, the bot only responds in these channels (whitelist)."
     prompt: "Allowed channel IDs (comma-separated)"
     password: false
+  - name: MATTERMOST_CALLBACK_HOST
+    description: "HTTP callback server bind address (default: 0.0.0.0)"
+    prompt: "Callback server host"
+    password: false
+  - name: MATTERMOST_CALLBACK_PORT
+    description: "HTTP callback server port (default: 8580)"
+    prompt: "Callback server port"
+    password: false
+  - name: MATTERMOST_CALLBACK_URL
+    description: "Public URL for Mattermost to POST action callbacks; auto-derived from host/port when not set"
+    prompt: "Callback public URL"
+    password: false
+  - name: MATTERMOST_SLASH_WEBHOOK_PUBLIC_URL
+    description: "Public URL for Mattermost to POST slash command invocations; auto-derived from callback URL when not set"
+    prompt: "Slash webhook public URL"
+    password: false
