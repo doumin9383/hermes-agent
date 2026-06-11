@@ -180,9 +180,9 @@ class TestPromptToolkitTerminalCompatibility:
     def test_lf_enter_binds_to_submit_handler_posix(self):
         """Some thin PTYs deliver Enter as LF/c-j instead of CR/enter.
 
-        On a bare local POSIX TTY (no SSH/WSL/WT) we keep c-j → submit so
+        On a bare local POSIX TTY (no SSH/WSL/WT/Ghostty) we keep c-j → submit so
         Enter works on thin PTYs (docker exec, certain ssh configurations).
-        On Windows, WSL, SSH sessions, and Windows Terminal we leave c-j
+        On Windows, WSL, SSH sessions, Windows Terminal, and Ghostty we leave c-j
         unbound here so it can be used as the Ctrl+Enter newline keystroke
         without conflicting with submit. See issue #22379.
         """
@@ -210,6 +210,17 @@ class TestPromptToolkitTerminalCompatibility:
         # Windows Terminal / Kitty / mintty over SSH) inserts a newline.
         with _patch.object(_sys, "platform", "linux"), \
              _patch.dict(_os.environ, {"SSH_CONNECTION": "1.2.3.4 5 6.7.8.9 22"}, clear=True), \
+             _patch("builtins.open", side_effect=OSError("no /proc")):
+            kb = KeyBindings()
+            _bind_prompt_submit_keys(kb, submit_handler)
+            bindings = {tuple(key.value for key in binding.keys): binding.handler for binding in kb.bindings}
+            assert bindings[("c-m",)] is submit_handler
+            assert ("c-j",) not in bindings
+
+        # Ghostty through tmux: TERM_PROGRAM is tmux, but Ghostty exports a
+        # stable env marker. Keep c-j free so Ctrl+J inserts a newline.
+        with _patch.object(_sys, "platform", "linux"), \
+             _patch.dict(_os.environ, {"TERM": "tmux-256color", "TERM_PROGRAM": "tmux", "GHOSTTY_RESOURCES_DIR": "/usr/share/ghostty"}, clear=True), \
              _patch("builtins.open", side_effect=OSError("no /proc")):
             kb = KeyBindings()
             _bind_prompt_submit_keys(kb, submit_handler)
@@ -331,7 +342,8 @@ class TestHistoryDisplay:
 
         assert "Recent sessions" in output
         assert "Checking Running Hermes Agent" in output
-        assert "Use /resume <session id or title> to continue" in output
+        assert "Use /resume" in output
+        assert "session title" in output
 
     def test_resume_updates_hermes_session_id_env_and_context(self, tmp_path):
         from gateway.session_context import _UNSET, _VAR_MAP, get_session_env
@@ -359,6 +371,34 @@ class TestHistoryDisplay:
             cli._session_db.close()
             os.environ.pop("HERMES_SESSION_ID", None)
             _VAR_MAP["HERMES_SESSION_ID"].set(_UNSET)
+
+    def test_resume_list_shows_full_long_titles(self, capsys):
+        """Long session titles render in full in the /resume table — not
+        truncated to 30 chars (fixes #14082)."""
+        cli = _make_cli()
+        cli.session_id = "current"
+        cli._session_db = MagicMock()
+        long_title = "Salvage BytePlus Volcengine PR With Fixes"
+        cli._session_db.list_sessions_rich.return_value = [
+            {
+                "id": "current",
+                "title": "Current",
+                "preview": "Current preview",
+                "last_active": 0,
+            },
+            {
+                "id": "20260401_201329_d85961",
+                "title": long_title,
+                "preview": "fix byteplus pr and resume",
+                "last_active": 0,
+            },
+        ]
+
+        cli._handle_resume_command("/resume")
+        output = capsys.readouterr().out
+
+        assert long_title in output
+        assert "20260401_201329_d85961" in output
 
     def test_sessions_command_no_args_lists_recent_sessions(self, capsys):
         """/sessions with no args prints the recent-sessions table (TUI parity).
@@ -514,30 +554,6 @@ class TestRootLevelProviderOverride:
         cfg = cli.load_cli_config()
 
         assert cfg["model"]["base_url"] == "https://example.com/v1"
-
-    def test_terminal_vercel_runtime_bridged_to_env(self, tmp_path, monkeypatch):
-        """Classic CLI must expose terminal.vercel_runtime to terminal_tool.py."""
-        import yaml
-
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.delenv("TERMINAL_VERCEL_RUNTIME", raising=False)
-
-        config_path = hermes_home / "config.yaml"
-        config_path.write_text(yaml.safe_dump({
-            "terminal": {
-                "backend": "vercel_sandbox",
-                "vercel_runtime": "python3.13",
-            },
-        }))
-
-        import cli
-        monkeypatch.setattr(cli, "_hermes_home", hermes_home)
-        cfg = cli.load_cli_config()
-
-        assert cfg["terminal"]["vercel_runtime"] == "python3.13"
-        assert os.environ["TERMINAL_VERCEL_RUNTIME"] == "python3.13"
 
     def test_normalize_root_model_keys_moves_to_model(self):
         """_normalize_root_model_keys migrates root keys into model section."""

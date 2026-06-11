@@ -52,10 +52,24 @@ from typing import Dict, List, Tuple
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
 
-# Directories to skip during discovery — the e2e + integration suites
-# require real services and are run separately. Match exactly the
-# ``--ignore=`` flags the previous CI command used.
-_SKIP_PARTS = {"integration", "e2e"}
+# Directories to skip during discovery — these suites require real
+# external services (a model gateway, a docker daemon with a prebuilt
+# image, etc.) and are run in their own dedicated CI jobs:
+#
+#   tests/e2e/         — .github/workflows/tests.yml :: e2e job
+#   tests/integration/ — historical; legacy --ignore flags
+#   tests/docker/      — .github/workflows/docker-publish.yml ::
+#                        build-amd64 job (runs against the freshly-loaded
+#                        nousresearch/hermes-agent:test image, via
+#                        ``HERMES_TEST_IMAGE`` so the fixture skips
+#                        rebuild). The full pytest-shard runner can't
+#                        host these because the session-scoped
+#                        ``built_image`` fixture would do a 3-7min
+#                        ``docker build`` inside a 180s per-test
+#                        pytest-timeout cap (set by tests/docker/conftest.py),
+#                        so the build is guaranteed to die in fixture
+#                        setup. The dedicated job sidesteps both costs.
+_SKIP_PARTS = {"integration", "e2e", "docker"}
 
 # Per-file wall-clock cap. Generous default — pytest-timeout still
 # enforces per-test caps inside each subprocess; this is just an outer
@@ -136,7 +150,10 @@ def _discover_files(roots: List[Path]) -> List[Path]:
 
     Exclude any file whose path contains a component in ``_SKIP_PARTS``,
     UNLESS the user explicitly named it as a root (in which case the
-    user's intent overrides the skip filter).
+    user's intent overrides the skip filter). This makes
+    ``scripts/run_tests.sh tests/docker/`` work locally the same way
+    ``pytest tests/docker/`` does — the CI-level skip exists to keep
+    the sharded matrix from blowing up, not to block targeted runs.
     """
     seen: set[Path] = set()
     out: List[Path] = []
@@ -151,8 +168,17 @@ def _discover_files(roots: List[Path]) -> List[Path]:
                 seen.add(real)
                 out.append(root)
             continue
+        # If the explicit root itself sits inside a skipped dir (e.g.
+        # the user said ``tests/docker``), the user has overridden the
+        # skip for that subtree. Compute the set of skip-parts the user
+        # opted into, and only filter files whose path crosses a
+        # skip-part *outside* that opt-in.
+        root_skip_overrides = {
+            part for part in root.parts if part in _SKIP_PARTS
+        }
+        effective_skips = _SKIP_PARTS - root_skip_overrides
         for path in root.rglob("test_*.py"):
-            if any(part in _SKIP_PARTS for part in path.parts):
+            if any(part in effective_skips for part in path.parts):
                 continue
             real = path.resolve()
             if real in seen:
@@ -220,6 +246,98 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         pass
 
 
+def _spawn_pytest_once(
+    cmd: List[str],
+    repo_root: Path,
+    file_timeout: float,
+    *,
+    timeout_note: str = "per-file timeout",
+) -> Tuple[int, str]:
+    """Run one ``pytest`` subprocess to completion and return ``(rc, output)``.
+
+    Spawns the child in its own process group / session so a hung file and
+    its grandchildren (uvicorn servers, async runtimes, etc.) can be SIGKILL'd
+    as a tree on timeout rather than orphaning onto PID 1. Shared by the
+    primary per-file run and the exit-4 retry loop so the lifecycle/cleanup
+    logic lives in exactly one place.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        # POSIX: place the child at the head of its own process group so
+        # _kill_tree can SIGKILL the group atomically.
+        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+        # _kill_tree handles the Windows path via taskkill /F /T.
+        start_new_session=True,
+    )
+
+    # Capture the pgid NOW, before the leader can exit and be reaped. Once
+    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
+    # even though grandchildren in that group are still alive — defeating
+    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
+    pgid: int | None = None
+    if sys.platform != "win32":
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, PermissionError):
+            pgid = None
+
+    try:
+        output, _ = proc.communicate(timeout=file_timeout)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc, pgid=pgid)
+        try:
+            output, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            output = "(file timeout exceeded; output unavailable)"
+        rc = 124  # de facto convention for "killed by timeout".
+        output = (
+            f"({timeout_note}: {file_timeout:.0f}s exceeded; "
+            f"process tree SIGKILL'd)\n{output}"
+        )
+    except BaseException:
+        # KeyboardInterrupt / runner crash — make sure no zombie
+        # grandchildren outlive us.
+        _kill_tree(proc, pgid=pgid)
+        raise
+    else:
+        # Happy path: pytest exited on its own. Kill the group anyway in
+        # case it left grandchildren behind; already-dead is a no-op.
+        _kill_tree(proc, pgid=pgid)
+
+    return rc, output
+
+
+# How many times to re-run a file that exits 4 ("file or directory not found")
+# while the file demonstrably exists on disk. On loaded shared CI runners the
+# planner can enumerate a file (tests counted via --collect-only) but the
+# per-file subprocess fail to stat it moments later — and a SINGLE immediate
+# retry can land in the same brief high-load window and fail again. We retry a
+# few times with a short backoff so transient I/O pressure has time to settle.
+_EXIT4_RETRY_ATTEMPTS = 3
+_EXIT4_RETRY_BACKOFF_SECONDS = 0.5
+
+
+def _file_present(file: Path, *, attempts: int = 3, delay: float = 0.2) -> bool:
+    """Return True if ``file`` exists, re-checking a few times.
+
+    ``Path.exists()`` itself issues a ``stat`` that can transiently fail under
+    the same load that makes pytest report "file or directory not found", so a
+    single negative check is not authoritative. Only conclude the file is
+    genuinely missing if it's absent across several spaced checks.
+    """
+    for i in range(attempts):
+        if file.exists():
+            return True
+        if i < attempts - 1:
+            time.sleep(delay)
+    return False
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
@@ -254,60 +372,60 @@ def _run_one_file(
     """
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     subproc_start = time.monotonic()
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    rc, output = _spawn_pytest_once(cmd, repo_root, file_timeout)
 
-    # Capture the pgid NOW, before the leader can exit and be reaped.
-    # Once the leader is reaped, os.getpgid(proc.pid) raises
-    # ProcessLookupError even though grandchildren in that group are
-    # still alive — defeating the whole cleanup. None on Windows where
-    # the pgid concept doesn't apply (taskkill walks ppid chain instead).
-    pgid: int | None = None
-    if sys.platform != "win32":
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            # Astonishingly fast child? Already dead. _kill_tree's
-            # fallback will handle this case as a no-op.
-            pgid = None
-
-    try:
-        output, _ = proc.communicate(timeout=file_timeout)
-        rc = proc.returncode
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
-        # Drain whatever the child wrote before we killed it so we have
-        # something to surface in the failure dump.
-        try:
-            output, _ = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            output = "(file timeout exceeded; output unavailable)"
-        rc = 124  # de facto convention for "killed by timeout".
-        output = (
-            f"(per-file timeout: {file_timeout:.0f}s exceeded; "
-            f"process tree SIGKILL'd)\n{output}"
+    # pytest exit 4 = "file or directory not found" at exec time. On loaded
+    # shared CI runners we have seen the planner enumerate a file (its tests
+    # counted via --collect-only) but the per-file subprocess fail to stat it
+    # moments later — a transient the deterministic LPT slicer otherwise
+    # reproduces on every rerun (same file set → same shard). Re-run the file a
+    # few times with a short backoff so the I/O pressure has time to settle,
+    # but ONLY while the file demonstrably exists on disk. A single immediate
+    # retry (the old behaviour) could land in the same brief high-load window
+    # and fail again; a single Path.exists() check could itself be a flaky stat
+    # under that load, so we re-check existence across spaced attempts.
+    # We do NOT widen the exit-5 rule: exit 4 on a file that genuinely does not
+    # exist must still fail.
+    attempt = 0
+    while rc == 4 and attempt < _EXIT4_RETRY_ATTEMPTS and _file_present(file):
+        attempt += 1
+        time.sleep(_EXIT4_RETRY_BACKOFF_SECONDS * attempt)
+        rc, output = _spawn_pytest_once(
+            cmd, repo_root, file_timeout,
+            timeout_note=f"per-file timeout on exit-4 retry {attempt}",
         )
-    except BaseException:
-        # KeyboardInterrupt / runner crash — make sure no zombie
-        # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
-        raise
-    else:
-        # Happy path: pytest exited on its own. The child process already
-        # cleaned up its grandchildren if it's well-behaved, but
-        # well-behaved is not universal — kill the group anyway. Already-
-        # dead processes are a no-op.
-        _kill_tree(proc, pgid=pgid)
+
+    if rc == 4:
+        # Exit-4 survived the retries (or the file was judged absent).
+        # Capture filesystem forensics so a CI-only "file not found" can
+        # be diagnosed from the log instead of guessed at: does the file
+        # exist NOW, what does the parent dir hold, and is the git tree
+        # clean?  (June 2026: a PR-added test file repeatedly hit exit 4
+        # on one CI shard while passing locally — these lines exist so
+        # the next occurrence is attributable.)
+        forensics = [f"--- exit-4 forensics for {file} ---"]
+        try:
+            forensics.append(f"exists={file.exists()} retries_used={attempt}")
+            parent = file.parent
+            if parent.exists():
+                names = sorted(p.name for p in parent.iterdir())
+                sibling_hint = [n for n in names if file.stem[:12] in n]
+                forensics.append(
+                    f"parent={parent} entries={len(names)} "
+                    f"similar={sibling_hint[:5]}"
+                )
+            else:
+                forensics.append(f"parent={parent} MISSING")
+            git_st = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_root, capture_output=True, text=True, timeout=10,
+            )
+            dirty = git_st.stdout.strip().splitlines()
+            forensics.append(f"git_dirty_entries={len(dirty)}")
+            forensics.extend(f"  {line}" for line in dirty[:10])
+        except Exception as exc:  # noqa: BLE001 — forensics must never mask rc=4
+            forensics.append(f"(forensics error: {exc})")
+        output = output + "\n" + "\n".join(forensics)
 
     if rc == 5:
         # No tests collected — every test in the file was filtered out.
