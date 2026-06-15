@@ -174,7 +174,10 @@ class MattermostAdapter(BasePlatformAdapter):
             async with self._session.get(url, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
-                    logger.error("MM API GET %s → %s: %s", path, resp.status, body[:200])
+                    if resp.status < 500:
+                        logger.warning("MM API GET %s → %s: %s", path, resp.status, body[:200])
+                    else:
+                        logger.error("MM API GET %s → %s: %s", path, resp.status, body[:200])
                     return {}
                 return await resp.json()
         except aiohttp.ClientError as exc:
@@ -194,7 +197,10 @@ class MattermostAdapter(BasePlatformAdapter):
             ) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
-                    logger.error("MM API POST %s → %s: %s", path, resp.status, body[:200])
+                    if resp.status < 500:
+                        logger.warning("MM API POST %s → %s: %s", path, resp.status, body[:200])
+                    else:
+                        logger.error("MM API POST %s → %s: %s", path, resp.status, body[:200])
                     return {}
                 return await resp.json()
         except aiohttp.ClientError as exc:
@@ -213,7 +219,10 @@ class MattermostAdapter(BasePlatformAdapter):
             ) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
-                    logger.error("MM API PUT %s → %s: %s", path, resp.status, body[:200])
+                    if resp.status < 500:
+                        logger.warning("MM API PUT %s → %s: %s", path, resp.status, body[:200])
+                    else:
+                        logger.error("MM API PUT %s → %s: %s", path, resp.status, body[:200])
                     return {}
                 return await resp.json()
         except aiohttp.ClientError as exc:
@@ -231,7 +240,10 @@ class MattermostAdapter(BasePlatformAdapter):
             ) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
-                    logger.error("MM API DELETE %s → %s: %s", path, resp.status, body[:200])
+                    if resp.status < 500:
+                        logger.warning("MM API DELETE %s → %s: %s", path, resp.status, body[:200])
+                    else:
+                        logger.error("MM API DELETE %s → %s: %s", path, resp.status, body[:200])
                     return False
                 return True
         except aiohttp.ClientError as exc:
@@ -1035,13 +1047,11 @@ class MattermostAdapter(BasePlatformAdapter):
     async def _register_slash_commands(self) -> None:
         """Register all gateway-available commands with Mattermost.
 
-        Iterates ``COMMAND_REGISTRY`` from the CLI and registers each
-        command that is available on the gateway via ``POST /api/v4/commands``.
-        Registered command IDs are stored so they can be cleaned up on
-        disconnect.
-
-        The webhook URL is set to ``self._slash_webhook_url``, which is
-        auto-derived from the callback server URL during startup.
+        Uses an upsert strategy: lists existing custom slash commands per
+        team, updates matching triggers via PUT, creates missing ones via
+        POST.  This avoids ``duplicate_trigger`` errors when commands
+        already exist from a previous unclean shutdown or from another
+        Hermes instance.
         """
         if not self._slash_webhook_url:
             logger.info(
@@ -1074,20 +1084,34 @@ class MattermostAdapter(BasePlatformAdapter):
 
         config_overrides = _resolve_config_gates()
         webhook_url = self._slash_webhook_url
-        registered_count = 0
+        created = 0
+        updated = 0
 
         for team_info in teams_data:
             team_id = team_info.get("id")
             if not team_id:
                 continue
 
+            # List existing custom slash commands for this team.
+            existing_cmds = await self._api_get(
+                f"commands?team_id={team_id}&custom_only=true"
+            )
+            if not isinstance(existing_cmds, list):
+                existing_cmds = []
+
+            # Build lookup: trigger → existing command dict.
+            existing_by_trigger = {}
+            for ec in existing_cmds:
+                trig = ec.get("trigger", "")
+                if trig:
+                    existing_by_trigger[trig] = ec
+
             for cmd in COMMAND_REGISTRY:
                 if not _is_gateway_available(cmd, config_overrides):
                     continue
-                # Mattermost custom slash commands use the trigger word;
-                # use the canonical command name.
+
                 trigger = cmd.name.lower().replace("_", "-")
-                description = cmd.description[:64]  # Mattermost limit
+                description = cmd.description[:64]
 
                 payload = {
                     "team_id": team_id,
@@ -1101,20 +1125,46 @@ class MattermostAdapter(BasePlatformAdapter):
                     "auto_complete_hint": cmd.args_hint or "",
                 }
 
-                result = await self._api_post("commands", payload)
-                if result and "id" in result:
-                    self._registered_slash_command_ids.append(result["id"])
-                    registered_count += 1
-                else:
-                    logger.debug(
-                        "Mattermost: failed to register slash command /%s "
-                        "(may already exist)", cmd.name,
+                existing = existing_by_trigger.get(trigger)
+                if existing:
+                    # Update the existing command so the webhook URL and
+                    # other properties stay current.
+                    cmd_id = existing["id"]
+                    result = await self._api_put(
+                        f"commands/{cmd_id}", payload
                     )
+                    if result and "id" in result:
+                        self._registered_slash_command_ids.append(result["id"])
+                        updated += 1
+                        logger.debug(
+                            "Mattermost: updated slash command /%s (%s)",
+                            cmd.name, cmd_id,
+                        )
+                    else:
+                        logger.warning(
+                            "Mattermost: failed to update slash command /%s (%s)",
+                            cmd.name, cmd_id,
+                        )
+                else:
+                    result = await self._api_post("commands", payload)
+                    if result and "id" in result:
+                        self._registered_slash_command_ids.append(result["id"])
+                        created += 1
+                    else:
+                        logger.warning(
+                            "Mattermost: failed to create slash command /%s",
+                            cmd.name,
+                        )
 
-        if registered_count:
+        if created or updated:
             logger.info(
-                "Mattermost: registered %d slash command(s) across %d team(s)",
-                registered_count, len(teams_data),
+                "Mattermost: slash commands — created %d, updated %d "
+                "across %d team(s)",
+                created, updated, len(teams_data),
+            )
+        else:
+            logger.debug(
+                "Mattermost: no slash commands created or updated",
             )
 
     async def _cleanup_slash_commands(self) -> None:
