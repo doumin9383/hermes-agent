@@ -46,6 +46,10 @@ _NEW_SEGMENT = object()
 # API/tool iterations (for example: "I'll inspect the repo first.").
 _COMMENTARY = object()
 
+# Sentinel to force-flush accumulated text before a user-facing prompt
+# (e.g. clarify/approval) so the prompt appears *after* the agent's text.
+_FLUSH = object()
+
 
 @dataclass
 class StreamConsumerConfig:
@@ -302,6 +306,16 @@ class GatewayStreamConsumer:
         """Signal that the stream is complete."""
         self._queue.put(_DONE)
 
+    def flush(self) -> None:
+        """Force accumulated text to be sent immediately.
+
+        Puts a ``_FLUSH`` sentinel in the queue.  When the consumer's
+        ``run()`` loop processes it, any buffered text is edited/sent
+        right away.  Use this before sending a user-facing prompt
+        (clarify, approval) so the agent's text appears first.
+        """
+        self._queue.put(_FLUSH)
+
     # ── Think-block filtering ────────────────────────────────────────
     # Models like MiniMax emit inline <think>...</think> blocks in their
     # content.  The CLI's _stream_delta suppresses these via a state
@@ -442,6 +456,7 @@ class GatewayStreamConsumer:
                 # Drain all available items from the queue
                 got_done = False
                 got_segment_break = False
+                got_flush = False
                 commentary_text = None
                 while True:
                     try:
@@ -451,6 +466,9 @@ class GatewayStreamConsumer:
                             break
                         if item is _NEW_SEGMENT:
                             got_segment_break = True
+                            break
+                        if item is _FLUSH:
+                            got_flush = True
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
@@ -471,6 +489,7 @@ class GatewayStreamConsumer:
                 should_edit = (
                     got_done
                     or got_segment_break
+                    or got_flush
                     or commentary_text is not None
                 )
                 if not self.cfg.buffer_only:

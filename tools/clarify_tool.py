@@ -48,7 +48,14 @@ def clarify_tool(
     if choices is not None:
         if not isinstance(choices, list):
             return tool_error("choices must be a list of strings.")
-        choices = [str(c).strip() for c in choices if str(c).strip()]
+        non_none = [c for c in choices if c is not None]
+        if non_none and not all(isinstance(c, str) for c in non_none):
+            return tool_error(
+                "each choice must be a plain string, not an object. "
+                "Example: [\"Option A\", \"Option B\"], not "
+                "[{\"key\": \"a\"}, {\"key\": \"b\"}]"
+            )
+        choices = [str(c).strip() for c in non_none if str(c).strip()]
         if len(choices) > MAX_CHOICES:
             choices = choices[:MAX_CHOICES]
         if not choices:

@@ -13118,6 +13118,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if event_type not in {"tool.started",}:
                 return
 
+            # Suppress progress bubble for clarify — it sends its own
+            # interactive prompt with buttons via send_clarify(), so an
+            # additional "❓ clarify: ..." message is redundant noise.
+            if tool_name == "clarify":
+                return
+
             # Suppress tool-progress bubbles once the user has sent `stop`.
             # When the LLM response carries N parallel tool calls, the agent
             # fires N "tool.started" events back-to-back before checking for
@@ -14059,6 +14065,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.pause_typing_for_chat(_status_chat_id)
                 except Exception:
                     pass
+
+                # Flush any buffered streaming text so the clarify prompt
+                # appears *after* the agent's preceding output, not before it.
+                _sc = stream_consumer_holder[0] if stream_consumer_holder else None
+                if _sc is not None and getattr(_sc, "flush", None) is not None:
+                    try:
+                        _sc.flush()
+                        # Give the event loop a tick to drain the queued flush.
+                        time.sleep(0.15)
+                    except Exception:
+                        pass
 
                 send_ok = False
                 fut = safe_schedule_threadsafe(
