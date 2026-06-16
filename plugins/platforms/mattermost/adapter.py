@@ -115,6 +115,9 @@ class MattermostAdapter(BasePlatformAdapter):
             or os.getenv("MATTERMOST_REPLY_MODE", "off")
         ).lower()
 
+        self._last_post_status: Optional[int] = None
+        self._last_post_error: str = ""
+
         # Dedup cache (prevent reprocessing)
         self._dedup = MessageDeduplicator()
 
@@ -190,13 +193,17 @@ class MattermostAdapter(BasePlatformAdapter):
         """POST /api/v4/{path} with JSON body."""
         import aiohttp
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
+        self._last_post_status = None
+        self._last_post_error = ""
         try:
             async with self._session.post(
                 url, headers=self._headers(), json=payload,
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as resp:
+                self._last_post_status = resp.status
                 if resp.status >= 400:
                     body = await resp.text()
+                    self._last_post_error = body or ""
                     if resp.status < 500:
                         logger.warning("MM API POST %s → %s: %s", path, resp.status, body[:200])
                     else:
@@ -204,8 +211,63 @@ class MattermostAdapter(BasePlatformAdapter):
                     return {}
                 return await resp.json()
         except aiohttp.ClientError as exc:
+            self._last_post_error = str(exc)
             logger.error("MM API POST %s network error: %s", path, exc)
             return {}
+
+    async def _thread_root_for_send(
+        self,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Resolve the Mattermost root_id from reply_to or metadata."""
+        if self._reply_mode != "thread":
+            return None
+        candidate = reply_to
+        if not candidate and isinstance(metadata, dict):
+            candidate = metadata.get("thread_id") or metadata.get("root_id")
+        if not candidate:
+            return None
+        return await self._resolve_root_id(str(candidate))
+
+    def _last_post_failure_is_broken_thread_root(self) -> bool:
+        """Return True only for clear invalid/missing Mattermost thread roots."""
+        if self._last_post_status not in {400, 404}:
+            return False
+        body = (self._last_post_error or "").lower()
+        if not body:
+            return False
+        rootish = any(marker in body for marker in ("root_id", "rootid", "root id", "thread", "post"))
+        broken = any(marker in body for marker in ("invalid", "not found", "does not exist", "missing"))
+        return rootish and broken
+
+    async def _post_preserving_thread(
+        self,
+        chat_id: str,
+        payload: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Post once, optionally falling back flat for final notify content."""
+        data = await self._api_post("posts", payload)
+        if data or "root_id" not in payload:
+            return data
+        if not (isinstance(metadata, dict) and metadata.get("notify")):
+            return data
+        if not self._last_post_failure_is_broken_thread_root():
+            return data
+
+        flat_payload = dict(payload)
+        flat_payload.pop("root_id", None)
+        original = str(flat_payload.get("message") or "")
+        flat_payload["message"] = (
+            "⚠️ Mattermost thread delivery failed; posting final reply in channel.\n\n"
+            + original
+        ).strip()
+        logger.warning(
+            "Mattermost: falling back to flat channel delivery for notify-worthy post in %s",
+            chat_id,
+        )
+        return await self._api_post("posts", flat_payload)
 
     async def _api_put(
         self, path: str, payload: Dict[str, Any]
@@ -406,7 +468,7 @@ class MattermostAdapter(BasePlatformAdapter):
             elif reply_to and self._reply_mode == "thread":
                 payload["root_id"] = await self._resolve_root_id(reply_to)
 
-            data = await self._api_post("posts", payload)
+            data = await self._post_preserving_thread(chat_id, payload, metadata)
             if not data or "id" not in data:
                 return SendResult(success=False, error="Failed to create post")
             last_id = data["id"]
@@ -1352,7 +1414,7 @@ class MattermostAdapter(BasePlatformAdapter):
         elif reply_to and self._reply_mode == "thread":
             payload["root_id"] = await self._resolve_root_id(reply_to)
 
-        data = await self._api_post("posts", payload)
+        data = await self._post_preserving_thread(chat_id, payload, metadata)
         if not data or "id" not in data:
             return SendResult(success=False, error="Failed to post with file")
         return SendResult(success=True, message_id=data["id"])
@@ -1397,7 +1459,7 @@ class MattermostAdapter(BasePlatformAdapter):
         elif reply_to and self._reply_mode == "thread":
             payload["root_id"] = await self._resolve_root_id(reply_to)
 
-        data = await self._api_post("posts", payload)
+        data = await self._post_preserving_thread(chat_id, payload, metadata)
         if not data or "id" not in data:
             return SendResult(success=False, error="Failed to post with file")
         return SendResult(success=True, message_id=data["id"])
@@ -1488,7 +1550,7 @@ class MattermostAdapter(BasePlatformAdapter):
                     "Mattermost: sending %d image(s) as single post (chunk %d/%d)",
                     len(file_ids), chunk_idx + 1, len(chunks),
                 )
-                data = await self._api_post("posts", payload)
+                data = await self._post_preserving_thread(chat_id, payload, metadata)
                 if not data or "id" not in data:
                     logger.warning("Mattermost: multi-image post failed, falling back")
                     await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
@@ -1778,6 +1840,7 @@ class MattermostAdapter(BasePlatformAdapter):
             user_id=sender_id,
             user_name=sender_name,
             thread_id=thread_id,
+            message_id=post_id,
         )
 
         # Per-channel ephemeral prompt

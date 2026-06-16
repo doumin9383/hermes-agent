@@ -1,5 +1,6 @@
-import { atom } from 'nanostores'
+import { atom, computed } from 'nanostores'
 
+import { lastVisibleMessageIsUser } from '@/app/chat/thread-loading'
 import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
@@ -10,13 +11,19 @@ type Updater<T> = T | ((current: T) => T)
 
 const WORKSPACE_CWD_KEY = 'hermes.desktop.workspace-cwd'
 
-// Cached copy of Settings → Sessions → Default project directory. The main
-// process persists this in project-dir.json, but the renderer must also honor it
-// when seeding $currentCwd — otherwise PR #37586's sticky localStorage home dir
-// wins and new sessions ignore the user's explicit picker choice.
 let configuredDefaultProjectDir = ''
 
-export const getRememberedWorkspaceCwd = (): string => storedString(WORKSPACE_CWD_KEY)?.trim() || ''
+function workspaceCwdKey(connection: HermesConnection | null = $connection.get()): string {
+  if (connection?.mode !== 'remote') {
+    return WORKSPACE_CWD_KEY
+  }
+
+  const base = encodeURIComponent(connection.baseUrl || 'remote')
+  const profile = encodeURIComponent(connection.profile || 'default')
+  return `${WORKSPACE_CWD_KEY}.remote.${base}.${profile}`
+}
+
+export const getRememberedWorkspaceCwd = (): string => storedString(workspaceCwdKey())?.trim() || ''
 
 export const getConfiguredDefaultProjectDir = (): string => configuredDefaultProjectDir
 
@@ -54,6 +61,13 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
     }
   }
 
+  const remembered = getRememberedWorkspaceCwd()
+
+  if ($connection.get()?.mode === 'remote') {
+    seedLiveCwd(remembered)
+    return
+  }
+
   if (configured) {
     const { cwd } = await sanitize(configured)
     seedLiveCwd(cwd)
@@ -61,8 +75,10 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
     return
   }
 
-  const { cwd } = await sanitize(getRememberedWorkspaceCwd())
-  seedLiveCwd(cwd)
+  if (remembered) {
+    const { cwd } = await sanitize(remembered)
+    seedLiveCwd(cwd)
+  }
 }
 
 export function applyConfiguredDefaultProjectDir(dir: null | string | undefined): void {
@@ -180,6 +196,15 @@ export const $workingSessionIds = atom<string[]>([])
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
 export const $messages = atom<ChatMessage[]>([])
+
+// Streaming-stable derivations of $messages. During a token stream the array
+// is replaced ~30×/s; components that only care about coarse facts (is the
+// thread empty? is the tail a user message?) subscribe to these instead of
+// $messages so per-token flushes don't re-render them — nanostores' `computed`
+// only notifies when the derived VALUE changes.
+export const $messagesEmpty = computed($messages, messages => messages.length === 0)
+export const $lastVisibleMessageIsUser = computed($messages, lastVisibleMessageIsUser)
+
 export const $freshDraftReady = atom(false)
 export const $busy = atom(false)
 export const $awaitingResponse = atom(false)
@@ -238,15 +263,16 @@ export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive,
 
 export const setCurrentCwd = (next: Updater<string>) => {
   updateAtom($currentCwd, next)
-  // Keep localStorage in sync with the atom: a real folder is remembered, an
-  // empty cwd clears the key (|| null → removeItem).
-  persistString(WORKSPACE_CWD_KEY, $currentCwd.get().trim() || null)
+  persistString(workspaceCwdKey(), $currentCwd.get().trim() || null)
 }
 
-/** Workspace for a brand-new chat. Explicit Settings override wins; otherwise
- *  fall back to the sticky last-used folder, then whatever is already live. */
-export const workspaceCwdForNewSession = (): string =>
-  getConfiguredDefaultProjectDir() || getRememberedWorkspaceCwd() || $currentCwd.get().trim()
+export const workspaceCwdForNewSession = (): string => {
+  if ($connection.get()?.mode === 'remote') {
+    return getRememberedWorkspaceCwd()
+  }
+
+  return getConfiguredDefaultProjectDir() || getRememberedWorkspaceCwd() || $currentCwd.get().trim()
+}
 
 export const setCurrentBranch = (next: Updater<string>) => updateAtom($currentBranch, next)
 export const setCurrentUsage = (next: Updater<UsageStats>) => updateAtom($currentUsage, next)

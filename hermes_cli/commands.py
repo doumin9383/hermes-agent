@@ -109,7 +109,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[text | pause | resume | clear | status]"),
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
                args_hint="[text | remove N | clear]"),
-    CommandDef("status", "Show session info", "Session"),
+    CommandDef("status", "Show session, model, token, and context info", "Session"),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
@@ -179,6 +179,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("cron", "Manage scheduled tasks", "Tools & Skills",
                cli_only=True, args_hint="[subcommand]",
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
+    CommandDef("suggestions", "Review suggested automations (accept/dismiss)",
+               "Tools & Skills", aliases=("suggest",), args_hint="[accept|dismiss N | catalog]",
+               subcommands=("accept", "dismiss", "catalog", "clear")),
+    CommandDef("blueprint", "Set up an automation from a blueprint template",
+               "Tools & Skills", aliases=("bp",), args_hint="[name] [slot=value ...]"),
     CommandDef("curator", "Background skill maintenance (status, run, pin, archive, list-archived)",
                "Tools & Skills", args_hint="[subcommand]",
                subcommands=("status", "run", "pause", "resume", "pin", "unpin", "restore", "list-archived")),
@@ -209,6 +214,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True),
     CommandDef("usage", "Show token usage and rate limits for the current session", "Info"),
+    CommandDef("credits", "Show Nous credit balance and top up", "Info"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
@@ -1025,6 +1031,30 @@ _SLACK_RESERVED_COMMANDS = frozenset({
     "topic", "mute", "pro", "shortcuts",
 })
 
+# High-value aliases that must survive Slack's 50-slash cap even when the
+# registry fills up. Without this, adding a new canonical command silently
+# clamps off low-priority aliases (they're added in the second pass), so a
+# long-standing native slash like /btw could disappear just because an
+# unrelated command landed. These claim their slots right after /hermes,
+# ahead of both canonical names and the rest of the aliases. Anything not
+# listed here still degrades gracefully (reachable via /hermes <command>).
+# Keep this list TIGHT: every pinned alias takes a slot a canonical command
+# would otherwise get, and the Telegram-parity test fails when a canonical
+# gets clamped ("reset" was unpinned for exactly that — /new keeps its
+# native slot, the alias spelling stays reachable via /hermes reset).
+_SLACK_PRIORITY_ALIASES = ("btw", "bg")
+
+# Canonical commands intentionally NOT given a native Slack slash slot. Slack
+# caps apps at 50 slash commands and the registry is at that ceiling; rather
+# than let the clamp silently drop whichever command sorts last (and break
+# Telegram parity), we explicitly route a few low-frequency commands through
+# ``/hermes <command>`` on Slack only. They remain native on every other
+# surface (CLI, TUI, Telegram, Discord). Keep this list TIGHT and intentional —
+# the telegram-parity test reads it so an entry here is a deliberate
+# "Slack-via-/hermes" decision, not a silent clamp.
+#   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits"})
+
 
 def _sanitize_slack_name(raw: str) -> str:
     """Convert a command name to a valid Slack slash command name.
@@ -1073,11 +1103,29 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             return
         if slack_name in _SLACK_RESERVED_COMMANDS:
             return
+        if slack_name in _SLACK_VIA_HERMES_ONLY:
+            # Intentionally Slack-via-/hermes only (see _SLACK_VIA_HERMES_ONLY).
+            return
         if len(entries) >= _SLACK_MAX_SLASH_COMMANDS:
             return
         # Slack description cap is 2000 chars; keep it short.
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
+
+    # Priority pass: pin high-value aliases (e.g. /btw, /bg, /reset) ahead of
+    # everything except /hermes, so a new canonical command can never silently
+    # clamp them off the 50-slash cap. Each alias borrows its parent command's
+    # description and hint.
+    _alias_to_cmd = {
+        alias: cmd
+        for cmd in COMMAND_REGISTRY
+        if _is_gateway_available(cmd, overrides)
+        for alias in cmd.aliases
+    }
+    for alias in _SLACK_PRIORITY_ALIASES:
+        cmd = _alias_to_cmd.get(alias)
+        if cmd is not None:
+            _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
 
     # First pass: canonical names (so they win slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:
