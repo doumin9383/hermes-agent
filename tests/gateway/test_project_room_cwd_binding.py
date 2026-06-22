@@ -10,6 +10,7 @@ from gateway.project_binding import (
     resolve_project_binding_for_chat,
     resolve_project_cwd_for_chat,
 )
+from gateway.run import GatewayRunner
 
 
 def _reset_project_binding_cache() -> None:
