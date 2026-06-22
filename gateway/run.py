@@ -39,6 +39,7 @@ import tempfile
 import threading
 import time
 import sqlite3
+import yaml
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -1669,6 +1670,121 @@ _configured_cwd = os.environ.get("TERMINAL_CWD", "")
 if not _configured_cwd or _configured_cwd in {".", "auto", "cwd"}:
     _fallback = os.getenv("MESSAGING_CWD") or str(Path.home())
     os.environ["TERMINAL_CWD"] = _fallback
+
+
+_PROJECT_BINDING_CACHE: dict[str, Any] = {
+    "path": None,
+    "mtime_ns": None,
+    "data": None,
+}
+
+
+def _candidate_project_config_paths() -> list[Path]:
+    """Return plausible agent-project mapping files in priority order."""
+    candidates = [
+        os.getenv("HERMES_PROJECT_CONFIG_PATH", "").strip(),
+        "/etc/agents/projects.yaml",
+        "/workspace/k3s-home-cluster/agents/projects.yaml",
+    ]
+    seen: set[str] = set()
+    resolved: list[Path] = []
+    for raw in candidates:
+        if not raw:
+            continue
+        path = str(Path(raw).expanduser())
+        if path in seen:
+            continue
+        seen.add(path)
+        resolved.append(Path(path))
+    return resolved
+
+
+def _load_project_bindings() -> dict[str, Any]:
+    """Load the room→project mapping from projects.yaml or a ConfigMap wrapper."""
+    for path in _candidate_project_config_paths():
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            logger.debug("project binding stat failed for %s: %s", path, exc)
+            continue
+
+        mtime_ns = getattr(stat, "st_mtime_ns", None) or int(stat.st_mtime * 1e9)
+        cached_path = _PROJECT_BINDING_CACHE.get("path")
+        cached_mtime = _PROJECT_BINDING_CACHE.get("mtime_ns")
+        if cached_path == str(path) and cached_mtime == mtime_ns:
+            cached = _PROJECT_BINDING_CACHE.get("data")
+            if isinstance(cached, dict):
+                return cached
+
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            logger.warning("project binding load failed for %s: %s", path, exc)
+            continue
+
+        if isinstance(raw, dict):
+            embedded = raw.get("data", {}).get("projects.yaml")
+            if isinstance(embedded, str) and embedded.strip():
+                try:
+                    raw = yaml.safe_load(embedded) or {}
+                except Exception as exc:
+                    logger.warning("embedded project binding load failed for %s: %s", path, exc)
+                    continue
+
+        if not isinstance(raw, dict):
+            logger.warning("project binding file %s did not parse to a mapping", path)
+            continue
+
+        _PROJECT_BINDING_CACHE.update(
+            {
+                "path": str(path),
+                "mtime_ns": mtime_ns,
+                "data": raw,
+            }
+        )
+        return raw
+
+    return {}
+
+
+def resolve_project_binding_for_chat(chat_id: str) -> dict[str, Any]:
+    """Return the first configured project binding for a messaging room/chat."""
+    room_id = str(chat_id or "").strip()
+    if not room_id:
+        return {}
+    config = _load_project_bindings()
+    projects = config.get("projects") if isinstance(config, dict) else None
+    if not isinstance(projects, dict):
+        return {}
+    for project_name, entry in projects.items():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("room") or "").strip() != room_id:
+            continue
+        resolved = dict(entry)
+        resolved.setdefault("project", project_name)
+        return resolved
+    return {}
+
+
+def resolve_project_cwd_for_chat(chat_id: str) -> str:
+    """Resolve a session-specific cwd from the room→project binding table."""
+    binding = resolve_project_binding_for_chat(chat_id)
+    raw_cwd = str(binding.get("defaultCwd") or binding.get("path") or "").strip()
+    if not raw_cwd:
+        return ""
+    cwd_path = Path(raw_cwd).expanduser()
+    if cwd_path.is_dir():
+        return str(cwd_path)
+    logger.warning(
+        "project binding cwd missing for chat %s (project=%s, cwd=%s)",
+        chat_id,
+        binding.get("project") or "",
+        raw_cwd,
+    )
+    return ""
 
 from gateway.config import (
     Platform,
@@ -12721,7 +12837,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         in a ``finally`` block.
         """
         from gateway.session_context import set_session_vars
-        # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
         # background=True) know whether this channel can wake a later turn.
         # Default True keeps CLI / unknown paths working; stateless adapters
@@ -12731,6 +12846,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+
+        session_cwd = resolve_project_cwd_for_chat(context.source.chat_id)
+        if session_cwd:
+            logger.debug(
+                "session cwd resolved from project binding: chat=%s cwd=%s",
+                context.source.chat_id,
+                session_cwd,
+            )
+
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -12741,6 +12865,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             async_delivery=_async_delivery,
+            cwd=session_cwd,
         )
 
     def _clear_session_env(self, tokens: list) -> None:
