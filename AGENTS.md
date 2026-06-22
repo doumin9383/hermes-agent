@@ -1368,3 +1368,34 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
+
+## ⚠️  Fork-specific rules — upstream merge hygiene
+
+This repository is a **fork of NousResearch/hermes-agent**.  We merge
+``upstream/main`` regularly and want to keep doing so with minimal friction.
+
+### Non-invasive upstream design
+
+1. **Nothing touches core files unless forced.**  ``gateway/run.py``,
+   ``cli.py``, ``run_agent.py`` are the highest-churn files upstream.
+   Every change to them is a potential conflict.  Isolate your logic in
+   separate modules and import one line.
+
+2. **New features go in separate files or plugins.**  The Mattermost
+   adapter lives entirely under ``plugins/platforms/mattermost/``.
+   Project binding (channel→cwd resolution) lives in
+   ``gateway/project_binding.py`` — ``gateway/run.py`` only has
+   an import and one call site.
+
+3. **The merge workflow:**
+   ```bash
+   git fetch upstream
+   git stash            # save local WIP
+   git merge upstream/main
+   # resolve conflicts — lean toward upstream's version
+   git stash pop        # re-apply local changes
+   # resolve any new conflicts
+   ```
+
+4. **If a conflict touches a file you changed, review whether your change
+   can be pushed to a separate module** so the next merge is conflict-free.
