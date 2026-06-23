@@ -1073,13 +1073,33 @@ class MattermostAdapter(BasePlatformAdapter):
             full_text, user_name, channel_id,
         )
 
+        # Resolve thread context for slash commands typed inside a thread.
+        # Mattermost v7.5+ includes root_id in the webhook payload; older
+        # versions may include post_id which we can look up.
+        thread_id: Optional[str] = None
+        raw_root = data.get("root_id")
+        if raw_root:
+            thread_id = str(raw_root)
+        else:
+            raw_post = data.get("post_id")
+            if raw_post:
+                try:
+                    post_data = await self._api_get(f"posts/{raw_post}")
+                    if post_data:
+                        thread_id = post_data.get("root_id") or raw_post
+                except Exception:
+                    logger.debug(
+                        "Mattermost: could not resolve thread from post_id %s",
+                        raw_post,
+                    )
+
         # Build source info.
         source = self.build_source(
             chat_id=channel_id,
             chat_type="channel",
             user_id=user_id,
             user_name=user_name,
-            thread_id=None,
+            thread_id=thread_id,
         )
 
         # Resolve per-channel prompt.
