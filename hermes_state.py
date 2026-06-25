@@ -1584,6 +1584,36 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def update_session_billing_route(
+        self,
+        session_id: str,
+        *,
+        provider: str,
+        base_url: str,
+        billing_mode: Optional[str] = None,
+    ) -> None:
+        """Unconditionally update the billing provider/base_url for a session.
+
+        Unlike ``update_token_counts`` which uses ``COALESCE(billing_provider, ?)``
+        (only filling in NULL), this unconditionally sets the billing fields so
+        that the dashboard reflects the user's latest /model switch.
+
+        Also nulls ``system_prompt`` so the cached snapshot (which embeds a
+        stale ``Model:`` / ``Provider:`` header) is rebuilt — matching the
+        behavior of ``update_session_model`` (see #48173, #48248).
+        """
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions SET
+                   billing_provider = ?,
+                   billing_base_url = ?,
+                   billing_mode = COALESCE(?, billing_mode),
+                   system_prompt = NULL
+                   WHERE id = ?""",
+                (provider, base_url, billing_mode, session_id),
+            )
+        self._execute_write(_do)
+
     def update_token_counts(
         self,
         session_id: str,
@@ -3934,6 +3964,24 @@ class SessionDB:
             else:
                 cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
             return cursor.fetchone()[0]
+
+    def has_platform_message_id(
+        self, session_id: str, platform_message_id: str
+    ) -> bool:
+        """Check if a message with the given platform_message_id exists.
+
+        Uses the idx_messages_platform_msg_id partial index for efficient
+        lookup. Used by the gateway's transient-failure dedupe guard (#47237)
+        to skip re-persisting a user message that was already saved on a
+        prior retry of the same inbound platform message.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT 1 FROM messages "
+                "WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
+                (session_id, platform_message_id),
+            )
+            return cursor.fetchone() is not None
 
     # =========================================================================
     # Export and cleanup
